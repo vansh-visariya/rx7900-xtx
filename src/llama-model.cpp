@@ -3357,3 +3357,61 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+
+int32_t llama_model_rescore_head_rows(
+        const struct llama_model * model, const float * h, int32_t h_n,
+        const int32_t * ids, float * out, int32_t k) {
+    if (model == nullptr || h == nullptr || ids == nullptr || out == nullptr || k <= 0) {
+        return 0;
+    }
+    const ggml_tensor * head = model->output;
+    const ggml_tensor * norm = model->output_norm;
+    // MTP models with a trained shared head verify drafts against it, not model.output
+    for (const struct llama_layer & layer : model->layers) {
+        if (layer.nextn.shared_head_head != nullptr) {
+            head = layer.nextn.shared_head_head;
+            if (layer.nextn.shared_head_norm != nullptr) {
+                norm = layer.nextn.shared_head_norm;
+            }
+            break;
+        }
+    }
+    if (head == nullptr || norm == nullptr || model->output_s != nullptr) {
+        return 0;
+    }
+    const int64_t n_embd = head->ne[0];
+    const int64_t n_vocab = head->ne[1];
+    if (h_n != n_embd || norm->ne[0] != n_embd) {
+        return 0;
+    }
+    const ggml_type_traits * traits = ggml_get_type_traits(head->type);
+    if (traits->to_float == nullptr) {
+        return 0;
+    }
+
+    // t_h_nextn is already post-head-norm (qwen35 MTP applies shared_head_norm
+    // before stashing it), so exact logits are plain dots: no norm is applied here
+    const float * hn = h;
+    (void) norm;
+
+    const size_t row_size = ggml_row_size(head->type, n_embd);
+    std::vector<uint8_t> buf_q(row_size);
+    std::vector<float>   row_f(n_embd);
+
+    for (int32_t r = 0; r < k; ++r) {
+        const int64_t id = ids[r];
+        if (id < 0 || id >= n_vocab) {
+            return 0;
+        }
+        ggml_backend_tensor_get(head, buf_q.data(), id*row_size, row_size);
+        traits->to_float(buf_q.data(), row_f.data(), n_embd);
+
+        double dot = 0.0;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            dot += (double) row_f[i]*hn[i];
+        }
+        out[r] = (float) dot;
+    }
+
+    return k;
+}

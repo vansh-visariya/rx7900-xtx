@@ -639,7 +639,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     // draft-only low-bit head: the draft context drafts with a cheap requantized copy of the
     // head while the target context keeps verifying with the full-precision one
-    if (params.cparams.draft_head != nullptr && cur->ne[1] == 1 && layer.nextn.shared_head_head == nullptr) {
+    if (params.cparams.draft_head != nullptr && cur->ne[1] == 1) {
         cur = build_lora_mm(params.cparams.draft_head, cur, nullptr);
     } else {
         cur = build_lora_mm(head_w, cur, head_s);

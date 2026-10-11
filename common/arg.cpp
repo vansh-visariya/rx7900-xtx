@@ -4229,6 +4229,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_HEAD_TYPE"));
     add_opt(common_arg(
+        {"--spec-draft-rerank-k"}, "K",
+        "rescore the top-K cheap-head draft candidates with the full head (default: 0 = off).\n"
+        "only affects MTP drafts using --spec-draft-head-type; target verification is unchanged",
+        [](common_params & params, const std::string & value) {
+            const int k = std::stoi(value);
+            if (k < 0 || k > 256) {
+                throw std::invalid_argument("rerank k must be in [0, 256]");
+            }
+            params.speculative.draft.rerank_k = k;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_RERANK_K"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",

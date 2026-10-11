@@ -526,12 +526,19 @@ bool llama_context::init_draft_head(enum ggml_type type) {
         return false;
     }
 
-    if (model.output == nullptr) {
+    // MTP models with a trained shared head draft from it, not model.output;
+    // the cheap copy must requantize the same matrix the draft path reads
+    const ggml_tensor * src = model.output;
+    for (const struct llama_layer & layer : model.layers) {
+        if (layer.nextn.shared_head_head != nullptr) {
+            src = layer.nextn.shared_head_head;
+            break;
+        }
+    }
+    if (src == nullptr) {
         LLAMA_LOG_WARN("%s: model has no output tensor, cannot create draft head\n", __func__);
         return false;
     }
-
-    const ggml_tensor * src = model.output;
 
     if (!ggml_is_quantized(type) || type == src->type) {
         LLAMA_LOG_WARN("%s: draft head type '%s' is not a usable requantization target (source is '%s')\n",

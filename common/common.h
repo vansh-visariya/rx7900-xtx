@@ -334,6 +334,9 @@ struct common_params_speculative_draft {
     // draft-only low-bit copy of the LM head (MTP draft contexts only)
     ggml_type head_type = GGML_TYPE_COUNT; // quant type for the draft head copy (GGML_TYPE_COUNT = disabled)
 
+    // exact top-k rerank of cheap-head drafts with the full head (0 = off)
+    int32_t rerank_k = 0; // number of cheap-head candidates rescored per draft step
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
