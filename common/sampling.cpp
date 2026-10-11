@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -675,6 +676,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+namespace {
+void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const std::vector<int> & idxs,
+        const llama_tokens & draft, const std::vector<llama_token> & result);
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
@@ -700,6 +706,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+    }
+
+    if (common_spec_stats_enabled()) {
+        spec_stats_record_verify(gsmpl, ctx, idxs, draft, result);
     }
 
     return result;
@@ -916,4 +926,203 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
     }
 
     return samplers;
+}
+
+//
+// speculative decoding diagnostics (LLAMA_SPEC_STATS)
+//
+
+namespace {
+
+struct spec_stats {
+    static constexpr int N_POS = 16;
+
+    bool enabled  = false;
+    int  interval = 64;
+
+    bool replay = false;
+
+    // q of the current draft, per draft position: (token id, prob)
+    std::vector<std::vector<std::pair<llama_token, float>>> q;
+
+    int64_t n_cycles    = 0; // verify cycles with stats (non-replay)
+    int64_t n_replay    = 0;
+    int64_t n_tokens    = 0; // tokens emitted by the stats cycles (accepted drafts + 1)
+    int64_t n_cycles_t  = 0; // all generation cycles (for timings)
+
+    int64_t n_eval[N_POS] = {};
+    double  sum_pex[N_POS] = {}; // p_target(draft token)          -> exact-match acceptance
+    double  sum_ov [N_POS] = {}; // sum_x min(p_target(x), q(x))   -> rejection-sampling acceptance
+    int64_t n_acc  [N_POS] = {}; // actually accepted (exact match, given the prefix was accepted)
+    int64_t n_reach[N_POS] = {};
+
+    double t_ms[COMMON_SPEC_STATS_T_COUNT] = {};
+
+    spec_stats() {
+        const char * env = getenv("LLAMA_SPEC_STATS");
+        if (env && atoi(env) != 0) {
+            enabled = true;
+            if (atoi(env) > 1) {
+                interval = atoi(env);
+            }
+        }
+    }
+
+    void print() const {
+        static const char * t_names[COMMON_SPEC_STATS_T_COUNT] = { "draft", "decode", "accept" };
+
+        std::string s_pex, s_ov, s_acc;
+        double len_ex = 1.0, len_rej = 1.0, prod_ex = 1.0, prod_rej = 1.0;
+        for (int k = 0; k < N_POS && n_eval[k] > 0; ++k) {
+            const double pex = sum_pex[k] / n_eval[k];
+            const double ov  = sum_ov [k] / n_eval[k];
+            const double acc = n_reach[k] > 0 ? (double) n_acc[k] / n_reach[k] : 0.0;
+            prod_ex  *= pex; len_ex  += prod_ex;
+            prod_rej *= ov;  len_rej += prod_rej;
+            s_pex += string_format("%.3f ", pex);
+            s_ov  += string_format("%.3f ", ov);
+            s_acc += string_format("%.3f ", acc);
+        }
+
+        LOG_INF("spec-stats: cycles %lld (replay %lld), observed len %.3f\n",
+                (long long) n_cycles, (long long) n_replay, n_cycles > 0 ? (double) n_tokens / n_cycles : 0.0);
+        LOG_INF("spec-stats:   observed exact acc/pos : %s\n", s_acc.c_str());
+        LOG_INF("spec-stats:   mean p(draft)  /pos    : %s-> model len %.3f (exact match)\n", s_pex.c_str(), len_ex);
+        LOG_INF("spec-stats:   mean sum min(p,q)/pos  : %s-> model len %.3f (rejection sampling)\n", s_ov.c_str(), len_rej);
+
+        std::string s_t;
+        for (int k = 0; k < COMMON_SPEC_STATS_T_COUNT; ++k) {
+            s_t += string_format("%s %.2f ms  ", t_names[k], n_cycles_t > 0 ? t_ms[k] / n_cycles_t : 0.0);
+        }
+        LOG_INF("spec-stats:   per cycle: %s\n", s_t.c_str());
+    }
+};
+
+spec_stats & g_spec_stats() {
+    static spec_stats s;
+    return s;
+}
+
+void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const std::vector<int> & idxs,
+        const llama_tokens & draft, const std::vector<llama_token> & result) {
+    auto & st = g_spec_stats();
+
+    if (st.replay) {
+        st.n_replay++;
+        return;
+    }
+
+    // evaluate the target distribution at every draft position (conditioned on the draft prefix) with a
+    // clone, so the real sampler state is untouched
+    common_sampler_ptr clone(common_sampler_clone(gsmpl));
+
+    for (size_t i = 0; i < draft.size() && i < (size_t) spec_stats::N_POS; ++i) {
+        common_sampler_sample(clone.get(), ctx, idxs[i], false);
+        const llama_token_data_array * cur_p = common_sampler_get_candidates(clone.get(), false);
+
+        double psum = 0.0;
+        for (size_t j = 0; j < cur_p->size; ++j) {
+            psum += cur_p->data[j].p;
+        }
+        if (psum <= 0.0) {
+            continue;
+        }
+
+        double pex = 0.0;
+        double ov  = 0.0;
+        const auto * q = i < st.q.size() ? &st.q[i] : nullptr;
+        for (size_t j = 0; j < cur_p->size; ++j) {
+            const double p = cur_p->data[j].p / psum;
+            if (cur_p->data[j].id == draft[i]) {
+                pex = p;
+            }
+            if (q) {
+                for (const auto & e : *q) {
+                    if (e.first == cur_p->data[j].id) {
+                        ov += std::min(p, (double) e.second);
+                        break;
+                    }
+                }
+            }
+        }
+
+        st.n_eval [i]++;
+        st.sum_pex[i] += pex;
+        st.sum_ov [i] += q ? ov : pex;
+    }
+
+    // observed exact-match acceptance per position
+    const size_t n_acc = result.size() - 1;
+    for (size_t i = 0; i < draft.size() && i < (size_t) spec_stats::N_POS; ++i) {
+        if (i > n_acc) {
+            break;
+        }
+        st.n_reach[i]++;
+        if (i < n_acc) {
+            st.n_acc[i]++;
+        }
+    }
+
+    st.n_cycles++;
+    st.n_tokens += result.size();
+}
+
+} // namespace
+
+bool common_spec_stats_enabled() {
+    return g_spec_stats().enabled;
+}
+
+void common_spec_stats_set_draft_q(int pos, const llama_token_data_array * cur_p) {
+    auto & st = g_spec_stats();
+    if (!st.enabled || pos < 0 || cur_p == nullptr || cur_p->size == 0) {
+        return;
+    }
+    if (pos == 0) {
+        st.q.clear();
+    }
+    if ((int) st.q.size() <= pos) {
+        st.q.resize(pos + 1);
+    }
+
+    // the draft sampler keeps the top-k candidates; renormalize their logits at temp 1
+    std::vector<llama_token_data> c(cur_p->data, cur_p->data + cur_p->size);
+    const size_t k = std::min<size_t>(c.size(), 10);
+    std::partial_sort(c.begin(), c.begin() + k, c.end(), [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    });
+
+    const float max_l = c[0].logit;
+    double sum = 0.0;
+    for (size_t j = 0; j < k; ++j) {
+        sum += expf(c[j].logit - max_l);
+    }
+
+    auto & q = st.q[pos];
+    q.clear();
+    for (size_t j = 0; j < k; ++j) {
+        q.emplace_back(c[j].id, (float) (expf(c[j].logit - max_l) / sum));
+    }
+}
+
+void common_spec_stats_set_replay(bool is_replay) {
+    g_spec_stats().replay = is_replay;
+}
+
+void common_spec_stats_add_time(enum common_spec_stats_time kind, double ms) {
+    auto & st = g_spec_stats();
+    if (st.enabled && kind >= 0 && kind < COMMON_SPEC_STATS_T_COUNT) {
+        st.t_ms[kind] += ms;
+    }
+}
+
+void common_spec_stats_end_cycle() {
+    auto & st = g_spec_stats();
+    if (!st.enabled) {
+        return;
+    }
+    st.n_cycles_t++;
+    if (st.n_cycles_t % st.interval == 0) {
+        st.print();
+    }
 }

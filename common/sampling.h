@@ -123,3 +123,21 @@ struct common_sampler_deleter {
 };
 
 typedef std::unique_ptr<common_sampler, common_sampler_deleter> common_sampler_ptr;
+
+// speculative decoding diagnostics, enabled with env LLAMA_SPEC_STATS=1 (off: all calls are no-ops)
+// records the draft distribution q per drafted position, then at verify time compares the exact-match
+// acceptance p(draft) against the lossless rejection-sampling acceptance sum_x min(p(x), q(x))
+enum common_spec_stats_time {
+    COMMON_SPEC_STATS_T_DRAFT  = 0,
+    COMMON_SPEC_STATS_T_DECODE = 1,
+    COMMON_SPEC_STATS_T_ACCEPT = 2,
+    COMMON_SPEC_STATS_T_COUNT,
+};
+
+bool common_spec_stats_enabled();
+// q of the draft at draft position pos, from the draft sampler candidates (softmax of their logits at temp 1)
+void common_spec_stats_set_draft_q(int pos, const llama_token_data_array * cur_p);
+void common_spec_stats_set_replay(bool is_replay);
+void common_spec_stats_add_time(enum common_spec_stats_time kind, double ms);
+// counts one completed generation cycle and prints the cumulative summary every N cycles
+void common_spec_stats_end_cycle();

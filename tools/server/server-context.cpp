@@ -3042,9 +3042,11 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t_draft_start = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            common_spec_stats_add_time(COMMON_SPEC_STATS_T_DRAFT, 1e-3*(ggml_time_us() - t_draft_start));
         }
 
         // make checkpoints if needed
@@ -3677,13 +3679,22 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
+        bool has_prompt = false;
+        for (int i = off; i < off + batch_view.n_tokens; ++i) {
+            has_prompt |= batch.tokens[i].is_prompt;
+        }
+
         int ret = 0;
+        const int64_t t_decode_start = ggml_time_us();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (!has_prompt) {
+            common_spec_stats_add_time(COMMON_SPEC_STATS_T_DECODE, 1e-3*(ggml_time_us() - t_decode_start));
+        }
 
         if (ret != 0) {
             {
@@ -3911,6 +3922,8 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                const int64_t t_accept_start = ggml_time_us();
+                common_spec_stats_set_replay(slot.spec_is_replay);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
@@ -3918,6 +3931,8 @@ private:
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 slot.spec_i_batch.clear();
+                common_spec_stats_add_time(COMMON_SPEC_STATS_T_ACCEPT, 1e-3*(ggml_time_us() - t_accept_start));
+                common_spec_stats_end_cycle();
 
                 GGML_ASSERT(accepted.size() >= 1);
 
