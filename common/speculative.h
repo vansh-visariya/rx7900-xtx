@@ -69,6 +69,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // rejection-sampling verification: sample each draft token from the draft distribution q
+    // (softmax(logits / temp_q) over the draft sampler's candidates) instead of taking the argmax,
+    // and record q[i] for result[i]. only the MTP draft implements it; otherwise q stays empty
+    bool  sample_q = false;
+    float temp_q   = 1.0f;
+    std::vector<std::vector<llama_token_data>> q;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

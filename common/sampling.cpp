@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -121,6 +122,8 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
+
+    std::mt19937 rng_spec; // rejection-sampling verification draws
 
     void reset() {
         prev.clear();
@@ -433,6 +436,7 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .rng_spec = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
     return result;
@@ -516,6 +520,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .rng_spec = */ gsmpl->rng_spec,
     };
 }
 
@@ -537,6 +542,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us = src->t_total_us;
+    dst->rng_spec   = src->rng_spec;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -707,6 +713,144 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
     }
+
+    if (common_spec_stats_enabled()) {
+        spec_stats_record_verify(gsmpl, ctx, idxs, draft, result);
+    }
+
+    return result;
+}
+
+llama_token common_spec_rejection_step(const llama_token_data_array & cur_p, llama_token x,
+        const std::vector<llama_token_data> & q, std::mt19937 & rng, bool & accepted) {
+    accepted = false;
+
+    auto q_of = [&q](llama_token id) -> double {
+        for (const auto & e : q) {
+            if (e.id == id) {
+                return e.p;
+            }
+        }
+        return 0.0;
+    };
+
+    double psum = 0.0;
+    double px   = 0.0;
+    for (size_t j = 0; j < cur_p.size; ++j) {
+        psum += cur_p.data[j].p;
+        if (cur_p.data[j].id == x) {
+            px = cur_p.data[j].p;
+        }
+    }
+
+    if (psum <= 0.0) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+
+    // accept x with probability min(1, p(x)/q(x))
+    const double qx = q_of(x);
+    if (qx > 0.0 && unif(rng) * qx * psum < px) {
+        accepted = true;
+        return x;
+    }
+
+    // rejected: sample from the residual norm(max(0, p - q))
+    std::vector<double> r(cur_p.size);
+    double rsum = 0.0;
+    for (size_t j = 0; j < cur_p.size; ++j) {
+        r[j] = std::max(0.0, cur_p.data[j].p / psum - q_of(cur_p.data[j].id));
+        rsum += r[j];
+    }
+
+    if (rsum <= 1e-12) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    llama_token z = LLAMA_TOKEN_NULL;
+    double u = unif(rng) * rsum;
+    for (size_t j = 0; j < cur_p.size; ++j) {
+        if (r[j] <= 0.0) {
+            continue;
+        }
+        z = cur_p.data[j].id;
+        u -= r[j];
+        if (u <= 0.0) {
+            break;
+        }
+    }
+
+    return z;
+}
+
+bool common_sampler_supports_rejection(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
+
+    const auto & params = gsmpl->params;
+
+    return gsmpl->grmr == nullptr &&
+        !params.backend_sampling &&
+        params.temp > 0.0f &&
+        params.mirostat == 0 &&
+        params.xtc_probability <= 0.0f &&
+        params.adaptive_target < 0.0f;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
+        struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_q, bool is_replay) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    if (!is_replay && (draft_q.size() < draft.size() || !common_sampler_supports_rejection(gsmpl))) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, false);
+    }
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    for (size_t i = 0; i < draft.size(); i++) {
+        const llama_token x = draft[i];
+
+        if (is_replay) {
+            common_sampler_accept(gsmpl, x, true);
+            result.push_back(x);
+            continue;
+        }
+
+        // target distribution p at this position (the sampled token y is a fallback only)
+        const llama_token y = common_sampler_sample(gsmpl, ctx, idxs[i], false);
+
+        bool accepted = false;
+        llama_token z = common_spec_rejection_step(gsmpl->cur_p, x, draft_q[i], gsmpl->rng_spec, accepted);
+        if (z == LLAMA_TOKEN_NULL) {
+            z = y; // degenerate p - keep the token sampled by the chain
+        }
+
+        if (accepted) {
+            common_sampler_accept(gsmpl, x, true);
+            result.push_back(x);
+            continue;
+        }
+
+        common_sampler_accept(gsmpl, z, true);
+        result.push_back(z);
+
+        if (common_spec_stats_enabled()) {
+            spec_stats_record_verify(gsmpl, ctx, idxs, draft, result);
+        }
+
+        return result;
+    }
+
+    // all drafts accepted: the bonus token is sampled from p
+    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[draft.size()], false);
+
+    common_sampler_accept(gsmpl, id, true);
+
+    result.push_back(id);
 
     if (common_spec_stats_enabled()) {
         spec_stats_record_verify(gsmpl, ctx, idxs, draft, result);

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <random>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1327,12 +1328,47 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// sample a draft token from q = softmax(logits / temp) over the top-k draft candidates and store q
+static llama_token common_speculative_sample_q(const llama_token_data_array * cur_p, float temp, std::mt19937 & rng,
+        std::vector<llama_token_data> & q) {
+    std::vector<llama_token_data> c(cur_p->data, cur_p->data + cur_p->size);
+    const size_t k = std::min<size_t>(c.size(), 10);
+    std::partial_sort(c.begin(), c.begin() + k, c.end(), [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    });
+
+    const float inv_t = 1.0f / std::max(temp, 1e-3f);
+    const float max_l = c[0].logit;
+
+    q.resize(k);
+    double sum = 0.0;
+    for (size_t j = 0; j < k; ++j) {
+        const double e = exp((double) (c[j].logit - max_l) * inv_t);
+        q[j] = { c[j].id, c[j].logit, (float) e };
+        sum += e;
+    }
+    for (auto & e : q) {
+        e.p = (float) (e.p / sum);
+    }
+
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    double u = unif(rng);
+    for (const auto & e : q) {
+        u -= e.p;
+        if (u <= 0.0) {
+            return e.id;
+        }
+    }
+    return q.back().id;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
+    std::vector<std::mt19937> rngs; // draft-q sampling (rejection-sampling verification)
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
@@ -1391,6 +1427,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+
+        rngs.clear();
+        for (uint32_t s = 0; s < n_seq; ++s) {
+            rngs.emplace_back(0x5eedu + s);
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1620,6 +1661,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            dp.q.clear();
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1683,8 +1725,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
+                auto & dp = dparams.at(seq_id);
+
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
+                if (dp.sample_q) {
+                    dp.q.emplace_back();
+                    id = common_speculative_sample_q(cur_p, dp.temp_q, rngs[seq_id], dp.q.back());
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1696,7 +1744,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);

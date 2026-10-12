@@ -5,6 +5,7 @@
 #include "common.h"
 
 #include <string>
+#include <random>
 #include <vector>
 
 // common_sampler extends llama_sampler with additional functionality:
@@ -87,6 +88,31 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// lossless speculative (rejection) sampling verification
+//
+// - the draft token draft[i] was sampled from the draft distribution draft_q[i] (ids + probs)
+// - it is accepted with probability min(1, p(x)/q(x)), where p is the target distribution after the sampler chain
+// - on rejection, a token is sampled from norm(max(0, p - q)) and the verification stops
+// - the emitted tokens are distributed exactly as when sampling from p token by token
+//
+// falls back to common_sampler_sample_and_accept_n when the sampler does not support it
+// (see common_sampler_supports_rejection) or when draft_q does not cover the draft
+// is_replay: the draft is a prefix already accepted before a checkpoint restore - accept it as is
+//
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
+        struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_q, bool is_replay);
+
+// one rejection-sampling step: p = cur_p (probs, need not be normalized), x ~ q
+// returns x with accepted = true, or a token from norm(max(0, p - q)) with accepted = false,
+// or LLAMA_TOKEN_NULL if p is degenerate
+llama_token common_spec_rejection_step(const llama_token_data_array & cur_p, llama_token x,
+        const std::vector<llama_token_data> & q, std::mt19937 & rng, bool & accepted);
+
+// true if the sampler chain yields an explicit distribution p that can be used for rejection sampling
+// (temp > 0, no grammar, no mirostat/xtc/adaptive-p, no backend sampling)
+bool common_sampler_supports_rejection(const struct common_sampler * gsmpl);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

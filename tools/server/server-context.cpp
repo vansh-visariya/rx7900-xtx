@@ -3025,13 +3025,18 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                        auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                        dp = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .sample_q = */ params_base.speculative.accept_rejection &&
+                                             common_sampler_supports_rejection(slot.smpl.get()),
+                            /* .temp_q   = */ params_base.speculative.draft_temp,
+                            /* .q        = */ {},
                         };
 
                         drafting.push_back(&slot);
@@ -3925,11 +3930,15 @@ private:
                 const int64_t t_accept_start = ggml_time_us();
                 common_spec_stats_set_replay(slot.spec_is_replay);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                const auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+                auto accepted = !synth_probs.empty()
+                    ? server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
+                    : (dp.sample_q
+                        ? common_sampler_sample_and_accept_n_rejection(
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, dp.q, slot.spec_is_replay)
+                        : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft));
                 slot.spec_i_batch.clear();
                 common_spec_stats_add_time(COMMON_SPEC_STATS_T_ACCEPT, 1e-3*(ggml_time_us() - t_accept_start));
                 common_spec_stats_end_cycle();
