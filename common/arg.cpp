@@ -4252,6 +4252,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_HEAD_TYPE"));
     add_opt(common_arg(
+        {"--spec-draft-vocab"}, "N",
+        "MTP draft head scores only the token ids [0, N) (BPE ids are roughly in frequency order), which\n"
+        "cuts its LM head read; verification keeps the full vocabulary, so output is unchanged\n"
+        "(default: 0 = full vocabulary)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--spec-draft-vocab must be >= 0");
+            }
+            params.speculative.draft.n_vocab = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB"));
+    add_opt(common_arg(
         {"--spec-draft-rerank-k"}, "K",
         "rescore the top-K cheap-head draft candidates with the full head (default: 0 = off).\n"
         "only affects MTP drafts using --spec-draft-head-type; target verification is unchanged",

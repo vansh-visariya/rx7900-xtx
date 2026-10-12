@@ -650,8 +650,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     // draft-only low-bit head: the draft context drafts with a cheap requantized copy of the
     // head while the target context keeps verifying with the full-precision one
+    const int64_t draft_n_vocab = params.cparams.draft_n_vocab;
     if (params.cparams.draft_head != nullptr && cur->ne[1] == 1) {
         cur = build_lora_mm(params.cparams.draft_head, cur, nullptr);
+    } else if (draft_n_vocab > 0 && draft_n_vocab < head_w->ne[1] && cur->ne[1] == 1) {
+        // reduced-vocabulary draft: score only the first draft_n_vocab rows of the head. drafts never
+        // propose the rarer ids, verification keeps the full vocabulary (lossless with rejection)
+        ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_n_vocab, head_w->nb[1], 0);
+        cur = build_lora_mm(head_sub, cur, head_s);
     } else {
         cur = build_lora_mm(head_w, cur, head_s);
     }

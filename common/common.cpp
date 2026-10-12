@@ -1752,6 +1752,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.draft_head_type = params.speculative.draft.head_type;
+    cparams.draft_n_vocab   = params.speculative.draft.n_vocab;
 
     return cparams;
 }

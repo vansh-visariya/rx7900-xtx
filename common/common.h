@@ -334,6 +334,8 @@ struct common_params_speculative_draft {
     // draft-only low-bit copy of the LM head (MTP draft contexts only)
     ggml_type head_type = GGML_TYPE_COUNT; // quant type for the draft head copy (GGML_TYPE_COUNT = disabled)
 
+    int32_t n_vocab = 0; // MTP draft head scores token ids [0, n_vocab) only (0 = full vocabulary)
+
     // exact top-k rerank of cheap-head drafts with the full head (0 = off)
     int32_t rerank_k = 0; // number of cheap-head candidates rescored per draft step
 

@@ -24,6 +24,9 @@ struct llama_cparams {
     // draft-only low-bit copy of the LM head (MTP draft contexts only; nullptr = disabled)
     ggml_tensor * draft_head = nullptr;
 
+    // MTP draft context: score only token ids [0, draft_n_vocab) (0 = full vocabulary)
+    int32_t draft_n_vocab = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

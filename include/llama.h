@@ -394,6 +394,10 @@ extern "C" {
         // the target context keeps using the full-precision head for verification
         enum ggml_type draft_head_type; // quant type for the draft head copy, GGML_TYPE_COUNT = disabled [EXPERIMENTAL]
 
+        // MTP draft context only: score just the token ids [0, draft_n_vocab) with the draft head
+        // (BPE ids are roughly in frequency order); verification keeps the full vocabulary. 0 = full
+        int32_t draft_n_vocab;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

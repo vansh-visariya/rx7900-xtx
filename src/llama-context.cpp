@@ -170,6 +170,11 @@ llama_context::llama_context(
         }
     }
 
+    if (params.draft_n_vocab > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        cparams.draft_n_vocab = std::min<int32_t>(params.draft_n_vocab, model.vocab.n_tokens());
+        LLAMA_LOG_INFO("%s: MTP draft head scores token ids [0, %d)\n", __func__, cparams.draft_n_vocab);
+    }
+
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
     }
@@ -3845,6 +3850,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.draft_head_type             =*/ GGML_TYPE_COUNT,
+        /*.draft_n_vocab               =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
