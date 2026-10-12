@@ -3496,7 +3496,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -9834,7 +9834,8 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
         pc, {dispatch_x, dispatch_y, 1});
 }
 
-void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+// snap: optional cache view [D, n_seqs, n_snap] the snapshots are written to instead of the dst tail
+void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * snap) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -9875,6 +9876,16 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t neq1 = (uint32_t)src_q->ne[1];
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
+    // snapshots straight into the recurrent cache (fused cpy), else into dst after the scores
+    vk_subbuffer snap_buf = dst_buf;
+    uint32_t n_snap = 0, snap_seq_stride = 0, snap_slot_stride = 0;
+    if (snap) {
+        snap_buf         = ggml_vk_tensor_subbuffer(ctx, snap);
+        n_snap           = (uint32_t)snap->ne[2];
+        snap_seq_stride  = (uint32_t)(snap->nb[1] / sizeof(float));
+        snap_slot_stride = (uint32_t)(snap->nb[2] / sizeof(float));
+    }
+
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
@@ -9883,11 +9894,12 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        n_snap, snap_seq_stride, snap_slot_stride
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, snap_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -12321,7 +12333,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        ggml_vk_gated_delta_net(ctx, compute_ctx, node,
+            ctx->num_additional_fused_ops ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops]->src[1] : nullptr);
 
         break;
 
@@ -13686,6 +13699,58 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
     return false;
 }
 
+// gated_delta_net followed (past view nodes) by the strided cpy that scatters its state snapshots into
+// the recurrent cache: the kernel writes the snapshots there itself and the cpy is elided. same match
+// as the CUDA backend's gdn cache fusion. returns the cpy's offset from node_idx, or 0
+static int ggml_vk_can_fuse_gdn_cpy(const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    // the kernel skips the snapshot tail, so the gdn output must not be a graph output
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * src_v     = gdn->src[2];
+    const int64_t       S_v       = src_v->ne[0];
+    const int64_t       H         = src_v->ne[1];
+    const int64_t       n_tokens  = src_v->ne[2];
+    const int64_t       n_seqs    = src_v->ne[3];
+    const int64_t       D         = S_v * S_v * H;
+    const int64_t       K         = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       n_written = std::min<int64_t>(n_tokens, K);
+
+    // snapshot tail starts right after the attention scores
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+
+    // the cpy is the first real node after the gdn
+    int j = node_idx + 1;
+    while (j < cgraph->n_nodes && ggml_op_is_empty(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * cpy = cgraph->nodes[j];
+    if (cpy->op != GGML_OP_CPY || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * src = cpy->src[0]; // view of the gdn snapshot tail
+    const ggml_tensor * dst = cpy->src[1]; // cache view the kernel writes to
+
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off || !ggml_is_contiguous(src)) {
+        return 0;
+    }
+
+    // dst is the [D, n_seqs, n_written] cache view with contiguous snapshots
+    if (dst->type != GGML_TYPE_F32 || dst->buffer == nullptr ||
+        dst->ne[0] != D || dst->ne[1] != n_seqs || dst->ne[2] != n_written || dst->ne[3] != 1 ||
+        dst->nb[0] != sizeof(float) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return 0;
+    }
+
+    return j - node_idx;
+}
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -14055,6 +14120,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (int gdn_cpy = ggml_vk_can_fuse_gdn_cpy(cgraph, i)) {
+                ctx->num_additional_fused_ops = gdn_cpy;
+                // the gdn writes its attention scores and the cpy's cache destination
+                ctx->fused_ops_write_mask |= 1;
+                fusion_string = "GATED_DELTA_NET_CPY";
+                std::fill_n(op_srcs_fused_elementwise, gdn_cpy + 1, false);
+                // the cpy reads its destination view, which the kernel writes in place
+                op_srcs_fused_elementwise[gdn_cpy] = true;
             } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "SNAKE";

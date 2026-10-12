@@ -681,6 +681,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    // external snapshot target (ggml_gated_delta_net_snap): n_snap == 0 writes snapshots to dst
+    uint32_t n_snap, snap_seq_stride, snap_slot_stride;
 };
 
 struct vk_op_ssm_scan_push_constants {
