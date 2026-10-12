@@ -448,6 +448,100 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S)
+// apply 4 sign bits to 4 packed grid bytes. the IQ2 grid bytes are 8..43, so each negated byte
+// (v ^ 0xFF) + 1 stays below 256 and the packed add never carries into the next byte
+int32_t iq2_signed(const uint v, const uint signs) {
+    const uint s = (signs & 1) | ((signs & 2) << 7) | ((signs & 4) << 14) | ((signs & 8) << 21);
+    return int32_t((v ^ (s * 0xFF)) + s);
+}
+#endif
+
+#if defined(DATA_A_IQ2_XXS)
+#define MMVQ_UNPACK_A
+// 2-byte loads, IQ2_XXS blocks are 66 bytes. per 32-value sub-block: 4 grid indices, then one
+// 32-bit word of four 7-bit sign groups (8th sign = parity) and a 4-bit scale
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    const uint qs_all = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[4 * ib32],
+        data_a_packed16[ib_k].qs[4 * ib32 + 1]));
+    const uint signscale = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[4 * ib32 + 2],
+        data_a_packed16[ib_k].qs[4 * ib32 + 3]));
+
+    [[unroll]] for (uint g = 0; g < 4; ++g) {
+        const uint sign7 = bitfieldExtract(signscale, 7 * int(g), 7);
+        const uint signs = sign7 | ((bitCount(sign7) & 1) << 7);
+        const uvec2 grid = iq2xxs_grid[(qs_all >> (8 * g)) & 0xFF];
+
+        a_qs[2 * g    ] = iq2_signed(grid.x, signs);
+        a_qs[2 * g + 1] = iq2_signed(grid.y, signs >> 4);
+    }
+
+    a_d = float(data_a_packed16[ib_k].d) * 0.25 * (0.5 + (signscale >> 28));
+}
+#endif
+
+#if defined(DATA_A_IQ2_XS)
+#define MMVQ_UNPACK_A
+#define MMVQ_UNPACK_A_HALF_SCALES
+// IQ2_XS: per 32-value sub-block 4 x (9-bit grid index | 7-bit signs) and one 4-bit scale per
+// 16 values, so the scale comes back per half sub-block
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out vec2 a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    [[unroll]] for (uint g = 0; g < 4; ++g) {
+        const uint qs    = uint(data_a_packed16[ib_k].qs[4 * ib32 + g]);
+        const uint sign7 = qs >> 9;
+        const uint signs = sign7 | ((bitCount(sign7) & 1) << 7);
+        const uvec2 grid = iq2xs_grid[qs & 511];
+
+        a_qs[2 * g    ] = iq2_signed(grid.x, signs);
+        a_qs[2 * g + 1] = iq2_signed(grid.y, signs >> 4);
+    }
+
+    const float d = float(data_a[ib_k].d);
+    const uint scale = uint(data_a[ib_k].scales[ib32]);
+    a_d = vec2(d * 0.25 * (0.5 + (scale & 0xF)), d * 0.25 * (0.5 + (scale >> 4)));
+}
+#endif
+
+#if defined(DATA_A_IQ2_S)
+#define MMVQ_UNPACK_A
+#define MMVQ_UNPACK_A_HALF_SCALES
+// IQ2_S: per 32-value sub-block 4 grid index low bytes, 2 high bits each in qh, 4 sign bytes in
+// the second half of qs, and one 4-bit scale per 16 values
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out vec2 a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    const uint qs_all = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[2 * ib32],
+        data_a_packed16[ib_k].qs[2 * ib32 + 1]));
+    const uint signs_all = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[QUANT_K / 16 + 2 * ib32],
+        data_a_packed16[ib_k].qs[QUANT_K / 16 + 2 * ib32 + 1]));
+    const uint qh = uint(data_a[ib_k].qh[ib32]);
+
+    [[unroll]] for (uint g = 0; g < 4; ++g) {
+        const uint idx   = ((qs_all >> (8 * g)) & 0xFF) | (((qh >> (2 * g)) & 3) << 8);
+        const uint signs = signs_all >> (8 * g);
+        const uvec2 grid = iq2s_grid[idx];
+
+        a_qs[2 * g    ] = iq2_signed(grid.x, signs);
+        a_qs[2 * g + 1] = iq2_signed(grid.y, signs >> 4);
+    }
+
+    const float d = float(data_a[ib_k].d);
+    const uint scale = uint(data_a[ib_k].scales[ib32]);
+    a_d = vec2(d * 0.25 * (0.5 + (scale & 0xF)), d * 0.25 * (0.5 + (scale >> 4)));
+}
+#endif
+
 #if defined(DATA_A_IQ3_XXS)
 #define MMVQ_UNPACK_A
 // 2-byte loads, IQ3_XXS blocks are 98 bytes. per 32-value sub-block: 8 grid indices, then one
