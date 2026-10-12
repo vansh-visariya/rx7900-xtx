@@ -448,12 +448,42 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
-#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S)
-// apply 4 sign bits to 4 packed grid bytes. the IQ2 grid bytes are 8..43, so each negated byte
-// (v ^ 0xFF) + 1 stays below 256 and the packed add never carries into the next byte
-int32_t iq2_signed(const uint v, const uint signs) {
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S)
+#define MMVQ_SIGN_TABLE
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ3_XXS)
+// indexed by the 7 stored sign bits, the 8th sign is their parity
+#define SIGN_TABLE_SIZE 128
+#else
+#define SIGN_TABLE_SIZE 256
+#endif
+// 8 sign bits -> two words with 0xFF in each byte whose value is negated
+shared uvec2 sign_masks[SIGN_TABLE_SIZE];
+
+uint spread_signs(const uint signs) {
     const uint s = (signs & 1) | ((signs & 2) << 7) | ((signs & 4) << 14) | ((signs & 8) << 21);
-    return int32_t((v ^ (s * 0xFF)) + s);
+    return s * 0xFF;
+}
+
+// filled before init_iq_shmem, whose barrier covers both tables
+void init_sign_table() {
+    [[unroll]] for (uint i = 0; i < SIGN_TABLE_SIZE; i += gl_WorkGroupSize.x) {
+        const uint idx = i + gl_LocalInvocationIndex.x;
+        if (SIGN_TABLE_SIZE % gl_WorkGroupSize.x == 0 || idx < SIGN_TABLE_SIZE) {
+#if SIGN_TABLE_SIZE == 128
+            const uint signs = idx | ((bitCount(idx) & 1) << 7);
+#else
+            const uint signs = idx;
+#endif
+            sign_masks[idx] = uvec2(spread_signs(signs), spread_signs(signs >> 4));
+        }
+    }
+}
+
+// apply a sign mask to 4 packed grid bytes. the grid bytes are nonzero (IQ2 8..43, IQ3_XXS 4..62,
+// IQ3_S 1..15), so each negated byte (v ^ 0xFF) + 1 stays below 256 and the packed add never
+// carries into the next byte
+int32_t grid_signed(const uint v, const uint mask) {
+    return int32_t((v ^ mask) + (mask & 0x01010101));
 }
 #endif
 
@@ -473,12 +503,11 @@ void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
         data_a_packed16[ib_k].qs[4 * ib32 + 3]));
 
     [[unroll]] for (uint g = 0; g < 4; ++g) {
-        const uint sign7 = bitfieldExtract(signscale, 7 * int(g), 7);
-        const uint signs = sign7 | ((bitCount(sign7) & 1) << 7);
+        const uvec2 m = sign_masks[bitfieldExtract(signscale, 7 * int(g), 7)];
         const uvec2 grid = iq2xxs_grid[(qs_all >> (8 * g)) & 0xFF];
 
-        a_qs[2 * g    ] = iq2_signed(grid.x, signs);
-        a_qs[2 * g + 1] = iq2_signed(grid.y, signs >> 4);
+        a_qs[2 * g    ] = grid_signed(grid.x, m.x);
+        a_qs[2 * g + 1] = grid_signed(grid.y, m.y);
     }
 
     a_d = float(data_a_packed16[ib_k].d) * 0.25 * (0.5 + (signscale >> 28));
@@ -496,12 +525,11 @@ void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out vec2 a_d) {
 
     [[unroll]] for (uint g = 0; g < 4; ++g) {
         const uint qs    = uint(data_a_packed16[ib_k].qs[4 * ib32 + g]);
-        const uint sign7 = qs >> 9;
-        const uint signs = sign7 | ((bitCount(sign7) & 1) << 7);
+        const uvec2 m = sign_masks[qs >> 9];
         const uvec2 grid = iq2xs_grid[qs & 511];
 
-        a_qs[2 * g    ] = iq2_signed(grid.x, signs);
-        a_qs[2 * g + 1] = iq2_signed(grid.y, signs >> 4);
+        a_qs[2 * g    ] = grid_signed(grid.x, m.x);
+        a_qs[2 * g + 1] = grid_signed(grid.y, m.y);
     }
 
     const float d = float(data_a[ib_k].d);
@@ -529,11 +557,11 @@ void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out vec2 a_d) {
 
     [[unroll]] for (uint g = 0; g < 4; ++g) {
         const uint idx   = ((qs_all >> (8 * g)) & 0xFF) | (((qh >> (2 * g)) & 3) << 8);
-        const uint signs = signs_all >> (8 * g);
+        const uvec2 m = sign_masks[(signs_all >> (8 * g)) & 0xFF];
         const uvec2 grid = iq2s_grid[idx];
 
-        a_qs[2 * g    ] = iq2_signed(grid.x, signs);
-        a_qs[2 * g + 1] = iq2_signed(grid.y, signs >> 4);
+        a_qs[2 * g    ] = grid_signed(grid.x, m.x);
+        a_qs[2 * g + 1] = grid_signed(grid.y, m.y);
     }
 
     const float d = float(data_a[ib_k].d);
@@ -556,19 +584,11 @@ void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
 
     [[unroll]] for (uint g = 0; g < 4; ++g) {
         const uint qs    = uint(data_a_packed16[ib_k].qs[4 * ib32 + g]);
-        const uint sign7 = bitfieldExtract(signscale, 7 * int(g), 7);
-        const uint signs = sign7 | ((bitCount(sign7) & 1) << 7);
+        const uvec2 m = sign_masks[bitfieldExtract(signscale, 7 * int(g), 7)];
 
         // grid holds 4 values, one per byte
-        const ivec4 vals0 = ivec4(unpack8(iq3xxs_grid[qs & 0xFF]));
-        const ivec4 vals1 = ivec4(unpack8(iq3xxs_grid[qs >> 8]));
-
-        // negate with (v ^ -s) - -s to avoid branches
-        const ivec4 m0 = -(ivec4(signs,      signs >> 1, signs >> 2, signs >> 3) & 1);
-        const ivec4 m1 = -(ivec4(signs >> 4, signs >> 5, signs >> 6, signs >> 7) & 1);
-
-        a_qs[2 * g    ] = pack32(i8vec4((vals0 ^ m0) - m0));
-        a_qs[2 * g + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
+        a_qs[2 * g    ] = grid_signed(iq3xxs_grid[qs & 0xFF], m.x);
+        a_qs[2 * g + 1] = grid_signed(iq3xxs_grid[qs >> 8],   m.y);
     }
 
     a_d = float(data_a_packed16[ib_k].d) * 0.5 * (0.5 + (signscale >> 28));
@@ -591,18 +611,11 @@ void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
     [[unroll]] for (uint l = 0; l < 4; ++l) {
         const uint qs    = uint(data_a_packed16[ib_k].qs[ib32 * 4 + l]);
         const uint qh    = qh_all >> (2 * l);
-        const uint signs = signs_all >> (8 * l);
+        const uvec2 m = sign_masks[(signs_all >> (8 * l)) & 0xFF];
 
         // grid holds 4 values of 1..15, one per byte
-        const ivec4 vals0 = ivec4(unpack8(iq3s_grid[( qs       & 0xFF) | ((qh & 1) << 8)]));
-        const ivec4 vals1 = ivec4(unpack8(iq3s_grid[((qs >> 8) & 0xFF) | ((qh & 2) << 7)]));
-
-        // negate with (v ^ -s) - -s to avoid branches
-        const ivec4 m0 = -(ivec4(signs,      signs >> 1, signs >> 2, signs >> 3) & 1);
-        const ivec4 m1 = -(ivec4(signs >> 4, signs >> 5, signs >> 6, signs >> 7) & 1);
-
-        a_qs[2 * l    ] = pack32(i8vec4((vals0 ^ m0) - m0));
-        a_qs[2 * l + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
+        a_qs[2 * l    ] = grid_signed(iq3s_grid[( qs       & 0xFF) | ((qh & 1) << 8)], m.x);
+        a_qs[2 * l + 1] = grid_signed(iq3s_grid[((qs >> 8) & 0xFF) | ((qh & 2) << 7)], m.y);
     }
 
     const uint scale = (uint(data_a_packed16[ib_k].scales[ib32 / 4]) >> ((ib32 & 3) * 4)) & 0xF;
