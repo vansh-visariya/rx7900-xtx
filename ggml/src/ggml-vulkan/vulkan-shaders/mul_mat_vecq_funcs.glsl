@@ -448,7 +448,92 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
+#if defined(DATA_A_IQ3_XXS)
+#define MMVQ_UNPACK_A
+// 2-byte loads, IQ3_XXS blocks are 98 bytes. per 32-value sub-block: 8 grid indices, then one
+// 32-bit word of four 7-bit sign groups (8th sign = parity) and a 4-bit scale
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    const uint signscale = pack32(u16vec2(
+        data_a_packed16[ib_k].qs[QUANT_K / 8 + 2 * ib32],
+        data_a_packed16[ib_k].qs[QUANT_K / 8 + 2 * ib32 + 1]));
+
+    [[unroll]] for (uint g = 0; g < 4; ++g) {
+        const uint qs    = uint(data_a_packed16[ib_k].qs[4 * ib32 + g]);
+        const uint sign7 = bitfieldExtract(signscale, 7 * int(g), 7);
+        const uint signs = sign7 | ((bitCount(sign7) & 1) << 7);
+
+        // grid holds 4 values, one per byte
+        const ivec4 vals0 = ivec4(unpack8(iq3xxs_grid[qs & 0xFF]));
+        const ivec4 vals1 = ivec4(unpack8(iq3xxs_grid[qs >> 8]));
+
+        // negate with (v ^ -s) - -s to avoid branches
+        const ivec4 m0 = -(ivec4(signs,      signs >> 1, signs >> 2, signs >> 3) & 1);
+        const ivec4 m1 = -(ivec4(signs >> 4, signs >> 5, signs >> 6, signs >> 7) & 1);
+
+        a_qs[2 * g    ] = pack32(i8vec4((vals0 ^ m0) - m0));
+        a_qs[2 * g + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
+    }
+
+    a_d = float(data_a_packed16[ib_k].d) * 0.5 * (0.5 + (signscale >> 28));
+}
+#endif
+
+#if defined(DATA_A_IQ3_S)
+#define MMVQ_UNPACK_A
+// 2-byte loads, IQ3_S blocks are 110 bytes. same unpacking as the IQ3_S MMQ block_a_to_shmem.
+// unpacks one 32-value sub-block to 8 packed int8 words + its scale, so the driver can reuse it
+// for every column of a multi-column (speculative verify) batch
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
+    const uint ib_k = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    // high index bit pairs for the 8 grid indices of this sub-block, and its 32 sign bits
+    const uint qh_all    = uint(data_a_packed16[ib_k].qh[ib32 / 2]) >> ((ib32 & 1) * 8);
+    const uint signs_all = uint(data_a_packed16[ib_k].signs[ib32 * 2]) | (uint(data_a_packed16[ib_k].signs[ib32 * 2 + 1]) << 16);
+
+    [[unroll]] for (uint l = 0; l < 4; ++l) {
+        const uint qs    = uint(data_a_packed16[ib_k].qs[ib32 * 4 + l]);
+        const uint qh    = qh_all >> (2 * l);
+        const uint signs = signs_all >> (8 * l);
+
+        // grid holds 4 values of 1..15, one per byte
+        const ivec4 vals0 = ivec4(unpack8(iq3s_grid[( qs       & 0xFF) | ((qh & 1) << 8)]));
+        const ivec4 vals1 = ivec4(unpack8(iq3s_grid[((qs >> 8) & 0xFF) | ((qh & 2) << 7)]));
+
+        // negate with (v ^ -s) - -s to avoid branches
+        const ivec4 m0 = -(ivec4(signs,      signs >> 1, signs >> 2, signs >> 3) & 1);
+        const ivec4 m1 = -(ivec4(signs >> 4, signs >> 5, signs >> 6, signs >> 7) & 1);
+
+        a_qs[2 * l    ] = pack32(i8vec4((vals0 ^ m0) - m0));
+        a_qs[2 * l + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
+    }
+
+    const uint scale = (uint(data_a_packed16[ib_k].scales[ib32 / 4]) >> ((ib32 & 3) * 4)) & 0xF;
+    a_d = float(data_a_packed16[ib_k].d) * float(1 + 2 * scale);
+}
+#endif
+
 #if defined(DATA_A_IQ4_XS)
+#define MMVQ_UNPACK_A
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out float a_d) {
+    const uint ib = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+
+    [[unroll]] for (uint j = 0; j < 4; ++j) {
+        const uint32_t vui = data_a_packed32[ib].qs[4 * ib32 + j];
+        const i32vec2 qs_a = iq4nl_to_i8x8(vui);
+        a_qs[j    ] = qs_a.x;
+        a_qs[j + 4] = qs_a.y;
+    }
+
+    const uint sl = (data_a_packed32[ib].scales_l >> (4 * ib32)) & 0xF;
+    const uint sh = (data_a_packed32[ib].scales_h >> (2 * ib32)) & 3;
+    a_d = float(data_a[ib].d) * float(int(sl | (sh << 4)) - 32);
+}
+
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     const uint ib = ib_a / 8;
     const uint ib32 = ib_a % 8;

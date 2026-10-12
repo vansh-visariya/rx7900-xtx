@@ -16,7 +16,7 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 #define K_PER_ITER 16
 #elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
 #define K_PER_ITER 8
-#elif defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M) || defined(DATA_A_IQ4_XS)
+#elif defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS)
 #define K_PER_ITER 32
 #else
 #error unimplemented
@@ -29,6 +29,43 @@ vec2 cache_b_ds;
 
 #include "mul_mat_vecq_funcs.glsl"
 
+#if defined(MMVQ_UNPACK_A)
+// K_PER_ITER == 32 types that can unpack A to int8: unpack each row once and dot it against every
+// column, instead of re-unpacking A per column. same integer sums and float products as the
+// per-column path
+void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+    int32_t b_qs[NUM_COLS][8];
+    float   b_d [NUM_COLS];
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+        const uint b_block_idx_outer = b_block_idx / 4;
+        const uint b_block_idx_inner = b_block_idx % 4;
+        b_d[j] = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]).x;
+        [[unroll]] for (uint k = 0; k < 8; ++k) {
+            b_qs[j][k] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + k];
+        }
+    }
+
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+        ibi += p.ncols;
+
+        int32_t a_qs[8];
+        float a_d;
+        mmvq_unpack_a(a_block_idx, a_qs, a_d);
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            int32_t q_sum = 0;
+            [[unroll]] for (uint k = 0; k < 8; ++k) {
+                q_sum += dotPacked4x8EXT(a_qs[k], b_qs[j][k]);
+            }
+            temp[j][n] += FLOAT_TYPE(b_d[j] * a_d * float(q_sum));
+        }
+    }
+}
+#else
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         // Preload data_b block
@@ -73,6 +110,8 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         }
     }
 }
+
+#endif
 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
