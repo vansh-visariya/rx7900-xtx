@@ -791,8 +791,9 @@ bool common_sampler_supports_rejection(const struct common_sampler * gsmpl) {
 
     const auto & params = gsmpl->params;
 
+    // backend sampling is fine: the backend chain exports the post-chain candidate probs, which is
+    // the p the rejection step needs (the backend-sampled token is only the degenerate-p fallback)
     return gsmpl->grmr == nullptr &&
-        !params.backend_sampling &&
         params.temp > 0.0f &&
         params.mirostat == 0 &&
         params.xtc_probability <= 0.0f &&
