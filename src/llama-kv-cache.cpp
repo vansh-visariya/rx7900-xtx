@@ -402,7 +402,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // empty cells (pos -1) never match: only scan the used range
+        const uint32_t i_beg = cells.used_min();
+        const uint32_t i_end = cells.used_max_p1();
+
+        for (uint32_t i = i_beg; i < i_end; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
@@ -426,7 +430,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            const uint32_t i_beg = cells.used_min();
+            const uint32_t i_end = cells.used_max_p1();
+
+            for (uint32_t i = i_beg; i < i_end; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }

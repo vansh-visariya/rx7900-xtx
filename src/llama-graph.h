@@ -275,6 +275,10 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // reversed rollback slot ids [K-1, ..., 0] (K = n_rs_seq + 1), created on demand by
+    // build_conv_state so the K per-layer conv-state snapshot copies become one SET_ROWS
+    ggml_tensor * rs_rev_idx = nullptr; // I32 [K]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -812,6 +816,18 @@ struct llm_graph_params {
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
+    static bool dflash_src_equal(const llama_cparams & a, const llama_cparams & b) {
+        if (a.dflash_n_src != b.dflash_n_src) {
+            return false;
+        }
+        for (int i = 0; i < a.dflash_n_src; ++i) {
+            if (a.dflash_src[i] != b.dflash_src[i] || a.dflash_src_data[i] != b.dflash_src_data[i] || a.dflash_src_buf[i] != b.dflash_src_buf[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
         bool can_reuse_ubatch =
@@ -876,6 +892,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            dflash_src_equal(cparams, other.cparams) &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

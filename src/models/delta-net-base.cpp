@@ -501,6 +501,38 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
+        // one SET_ROWS per layer instead of K copies: when the window of every slot lies inside
+        // conv_input (no clamping), the K snapshots are overlapping windows one element apart;
+        // slot of window u is K-1-u, i.e. the reversed index input
+        const int64_t s_idx0 = conv_input->ne[0] - conv_states->ne[0] - K + 1;
+        static const bool use_set_rows = getenv("LLAMA_CONV_SETROWS") != nullptr;
+        if (use_set_rows && n_seqs == 1 && s_idx0 >= 0 && conv_states_all->type == GGML_TYPE_F32 && conv_input->type == GGML_TYPE_F32) {
+            if (!inp->rs_rev_idx) {
+                inp->rs_rev_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, K);
+                ggml_set_input(inp->rs_rev_idx);
+                ggml_set_name(inp->rs_rev_idx, "rs_rev_idx");
+            }
+
+            const size_t es = ggml_element_size(conv_input);
+
+            // the K windows overlap (3*K elements per channel from a 3+K-1 strip), which ggml_view_3d's size
+            // check rejects, so build a 1-window view and widen it; its byte extent stays inside conv_input
+            ggml_tensor * windows = ggml_view_3d(ctx0, conv_input,
+                    conv_kernel_size - 1, 1, conv_channels,
+                    es, conv_input->nb[1],
+                    s_idx0 * es);
+            windows->ne[1] = K;
+            GGML_ASSERT(windows->view_offs + ggml_nbytes(windows) <= ggml_nbytes(conv_input));
+
+            ggml_tensor * slots = ggml_view_3d(ctx0, conv_states_all,
+                    conv_kernel_size - 1, K, conv_channels,
+                    (size_t) mem_size * row_size, (conv_kernel_size - 1) * ggml_element_size(conv_states_all),
+                    (size_t) kv_head * row_size);
+
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots, windows, inp->rs_rev_idx));
+            return conv_input;
+        }
+
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;

@@ -91,6 +91,11 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    bool dflash_inject_features_async(llama_context & tgt, const int32_t * layer_ids, int32_t n_layers, int32_t n_tokens);
+    void dflash_inject_features_clear();
+
+    void flush();
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -382,6 +387,15 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // draft contexts alternate between two graph shapes (target features / catch-up, and the draft itself);
+    // a second scheduler keeps the other graph allocated so neither is rebuilt per step. with graph_alt the
+    // front graph lives in gf_res_prev[0] (with sched) and the parked one in gf_res_alt (with sched_alt)
+    bool                   graph_alt = false;
+    ggml_backend_sched_ptr sched_alt;
+
+    llm_graph_result_ptr   gf_res_alt;
+    llm_graph_result *     gf_res_alt_active = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

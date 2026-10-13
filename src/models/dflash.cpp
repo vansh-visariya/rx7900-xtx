@@ -589,15 +589,32 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+        ggml_tensor * inp_target = nullptr;
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
+        if (cparams.dflash_n_src > 0) {
+            // the target's layer inputs of this ubatch, read in place: per token, the layers side by side
+            for (int k = 0; k < cparams.dflash_n_src; ++k) {
+                const ggml_tensor * src = cparams.dflash_src[k];
+                GGML_ASSERT(src->ne[1] == n_tokens && src->type == GGML_TYPE_F32);
+                // a leaf over the target's memory: no links into the target graph
+                ggml_tensor * leaf = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, src->ne[0], src->ne[1]);
+                leaf->data   = cparams.dflash_src_data[k];
+                leaf->buffer = (ggml_backend_buffer_t) cparams.dflash_src_buf[k];
+                ggml_format_name(leaf, "dflash_target_feat-%d", k);
+                inp_target = inp_target ? ggml_concat(ctx0, inp_target, leaf, 0) : leaf;
+            }
+            GGML_ASSERT(inp_target->ne[0] == n_embd_inp);
+        } else {
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        ggml_tensor * inp_target = inp->embd;
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+            ggml_set_input(inp->embd);
+
+            inp_target = inp->embd;
+
+            res->add_input(std::move(inp));
+        }
         cb(inp_target, "inp_target_features", -1);
-
-        res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
@@ -763,6 +780,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
         output   = model_other->output;
         output_s = model_other->output_s;
+    }
+
+    // DFlash2 with --spec-draft-vocab N: score only token ids [0, N) through a view of the head rows. The
+    // selector draws its candidates from these ids; verification keeps the full vocabulary
+    const int32_t draft_n_vocab = cparams.draft_n_vocab;
+    if (model.dflash_selector_hidden && !model.d2t && draft_n_vocab > 0 && draft_n_vocab < output->ne[1]) {
+        output = ggml_view_2d(ctx0, output, output->ne[0], draft_n_vocab, output->nb[1], 0);
     }
 
     cur = build_lora_mm(output, cur, output_s);

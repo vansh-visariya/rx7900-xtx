@@ -114,6 +114,18 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// DFlash: copy, on the device and without waiting, the inputs of the target layers `layer_ids` of the last
+// decode of ctx_tgt (one ubatch of n_tokens) into ctx_dft, and make the next decode of ctx_dft with an embd batch
+// read them instead of the batch embeddings. returns false if not possible (then nothing is armed)
+LLAMA_API bool llama_dflash_inject_features_async(struct llama_context * ctx_dft, struct llama_context * ctx_tgt,
+        const int32_t * layer_ids, int32_t n_layers, int32_t n_tokens);
+// submit work queued on the context's backends (e.g. output reads after a decode) without waiting, where the
+// backend supports it, so that it runs before work other contexts submit next
+LLAMA_API void llama_flush(struct llama_context * ctx);
+
+// disarm after the decode that consumed the features
+LLAMA_API void llama_dflash_inject_features_clear(struct llama_context * ctx_dft);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

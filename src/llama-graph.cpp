@@ -326,6 +326,18 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+static void llm_graph_set_rs_rev_idx(ggml_tensor * rs_rev_idx) {
+    if (!rs_rev_idx) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(rs_rev_idx->buffer));
+    int32_t * data = (int32_t *) rs_rev_idx->data;
+    const int64_t K = rs_rev_idx->ne[0];
+    for (int64_t i = 0; i < K; ++i) {
+        data[i] = (int32_t) (K - 1 - i);
+    }
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -340,6 +352,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    llm_graph_set_rs_rev_idx(rs_rev_idx);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1111,6 +1125,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_set_rs_rev_idx(inp_rs->rs_rev_idx);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1155,6 +1171,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_set_rs_rev_idx(inp_rs->rs_rev_idx);
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1229,6 +1247,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_set_rs_rev_idx(inp_rs->rs_rev_idx);
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
