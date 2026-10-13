@@ -424,6 +424,8 @@ enum FaCodePath {
     FA_SCALAR,
     FA_COOPMAT1,
     FA_COOPMAT2,
+    // coopmat1 for small grouped-query batches, output kept in accumulators (flash_attn_cm1_gqa.comp)
+    FA_COOPMAT1_GQA,
 };
 
 struct vk_fa_pipeline_state {

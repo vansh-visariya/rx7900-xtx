@@ -155,11 +155,13 @@ void init_indices()
     N = p.N;
     KV = p.KV;
 
+    // With grouped query attention a workgroup covers N / gqa_ratio consecutive query tokens
+    // (one, except on the coopmat1 path, which can pack several tokens into its rows).
     if (p.k_num > 1) {
         if (p.gqa_ratio > 1) {
             i = 0;
             // batch and split_k share gl_WorkGroupID.x
-            gqa_iq1 = gl_WorkGroupID.x / p.k_num;
+            gqa_iq1 = (gl_WorkGroupID.x / p.k_num) * (p.N / p.gqa_ratio);
             split_k_index = gl_WorkGroupID.x % p.k_num;
         } else {
             gqa_iq1 = 0;
@@ -168,7 +170,7 @@ void init_indices()
         }
     } else if (p.gqa_ratio > 1) {
         i = 0;
-        gqa_iq1 = gl_WorkGroupID.x;
+        gqa_iq1 = gl_WorkGroupID.x * (p.N / p.gqa_ratio);
         split_k_index = 0;
     } else {
         i = gl_WorkGroupID.x;
@@ -251,4 +253,29 @@ void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems,
 {
     uint32_t offset = (iq2 + r) * HSV / 4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
+}
+
+// Grouped query attention rows that span several query tokens: row r is query token
+// gqa_iq1 + r / gqa_ratio and head iq2 + r % gqa_ratio. A row is valid while r < N
+// and its token exists (the last workgroup may cover fewer tokens).
+uint32_t gqa_row_tok(const in uint32_t r)
+{
+    return r / p.gqa_ratio;
+}
+
+bool gqa_row_ok(const in uint32_t r)
+{
+    return r < p.N && gqa_iq1 + r / p.gqa_ratio < p.ne2;
+}
+
+// tok_stride is the distance between two tokens' outputs, in vec4 units for O and in floats for L/M.
+void gqaStoreTok(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t tok_stride)
+{
+    uint32_t offset = gqa_row_tok(r) * tok_stride + (iq2 + r % p.gqa_ratio) * HSV / 4 + c;
+    data_ov4[o_offset + offset] = D_TYPEV4(elems);
+}
+
+void gqaStoreTokCol0(const in uint32_t r, const in ACC_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t tok_stride)
+{
+    data_o[o_offset + gqa_row_tok(r) * tok_stride + iq2 + r % p.gqa_ratio] = D_TYPE(elem);
 }
