@@ -319,9 +319,13 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
 }
 
 void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+    // spin for the whole graph instead of sleeping on the almost_ready fence: a sleeping CPU lets schedutil
+    // drop the clock, and the host work that follows each graph then runs slowly (GGML_VK_SPIN_WAIT=0 sleeps)
+    static const bool spin_wait = [] { const char * e = getenv("GGML_VK_SPIN_WAIT"); return !e || atoi(e) != 0; }();
+
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
-    if (ctx->almost_ready_fence_pending) {
+    if (ctx->almost_ready_fence_pending && !spin_wait) {
         VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence", ctx->device);
         ctx->device->device.resetFences({ ctx->almost_ready_fence });
         ctx->almost_ready_fence_pending = false;
@@ -358,6 +362,11 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         }
     }
     ctx->device->device.resetFences({ ctx->fence });
+    if (ctx->almost_ready_fence_pending) {
+        // submitted before the final fence, so it has signaled by now
+        ctx->device->device.resetFences({ ctx->almost_ready_fence });
+        ctx->almost_ready_fence_pending = false;
+    }
 }
 
 static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
@@ -2689,14 +2698,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
-    // RDNA3: above four columns, static 4 rows for all types bench faster than the default
+    // RDNA3: above four columns, static rows for all integer-path types. 2 rows on the 7900 XTX (IQ2/IQ3/IQ4_XS/
+    // q4_K model, llama-bench pp5 183.4 -> 191.7, pp6 211.0 -> 219.9 vs 4 rows; 1 row 184.6 / 204.9)
     const bool is_rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
-    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3 && i >= 4) ? 4u : rows; };
+    // GGML_VK_RM_INT_HI / GGML_VK_RM_GRID_HI: A/B overrides for the rows per workgroup above four columns
+    // (all integer-path types / the IQ2_*-IQ3_* grid types)
+    const uint32_t rm_int_hi  = getenv("GGML_VK_RM_INT_HI")  ? (uint32_t) atoi(getenv("GGML_VK_RM_INT_HI"))  : 2u;
+    const uint32_t rm_grid_hi = getenv("GGML_VK_RM_GRID_HI") ? (uint32_t) atoi(getenv("GGML_VK_RM_GRID_HI")) : 0u;
+    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3 && i >= 4) ? rm_int_hi : rows; };
     // RDNA3: Static 4 rows for all types bench faster than the default
     auto const &rm_id = [&](uint32_t rows) { return is_rdna3 ? 4u : rows; };
     // RDNA3, IQ2_*/IQ3_* integer path at four columns (MTP-3 verify batch): 2 rows per workgroup amortize the
     // per-workgroup setup (shared-memory grid copy, reduction). 7900 XTX llama-bench pp4 +2.8%; pp2 -1.8%, so n < 4 keeps 1
-    auto const &rm_grid_int = [&](uint32_t i) { return (is_rdna3 && i == 3) ? 2u : rm_int_n(1*rm_stdq_int, i); };
+    auto const &rm_grid_int = [&](uint32_t i) {
+        if (is_rdna3 && i >= 4 && rm_grid_hi > 0) {
+            return rm_grid_hi;
+        }
+        return (is_rdna3 && i == 3) ? 2u : rm_int_n(1*rm_stdq_int, i);
+    };
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
@@ -12710,15 +12729,27 @@ ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
     return &dev->buffer_type;
 }
 
-static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
-    return GGML_VK_NAME "_Host";
+// host (pinned) buffer types, one per device: pinned memory is a device allocation, so a buffer pinned on
+// one device (e.g. an iGPU enumerated as device 0) is not pinned for another, and every "async" read into it
+// on the other device falls back to a synchronizing staging copy
+struct ggml_backend_vk_host_buffer_type_context {
+    size_t      device;
+    std::string name;
+};
 
-    UNUSED(buft);
+static size_t ggml_backend_vk_host_buft_device(ggml_backend_buffer_type_t buft) {
+    const auto * hctx = (const ggml_backend_vk_host_buffer_type_context *) buft->context;
+    return hctx ? hctx->device : 0;
+}
+
+static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    const auto * hctx = (const ggml_backend_vk_host_buffer_type_context *) buft->context;
+    return hctx ? hctx->name.c_str() : GGML_VK_NAME "_Host";
 }
 
 static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_free_buffer()");
-    ggml_vk_host_free(vk_instance.devices[0], buffer->context);
+    ggml_vk_host_free(vk_instance.devices[ggml_backend_vk_host_buft_device(buffer->buft)], buffer->context);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -12727,7 +12758,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+        ptr = ggml_vk_host_malloc(vk_instance.devices[ggml_backend_vk_host_buft_device(buft)], size);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
         // fallback to cpu buffer
@@ -12739,41 +12770,56 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
 
     return buffer;
-
-    UNUSED(buft);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
-
-    UNUSED(buft);
+    return vk_instance.devices[ggml_backend_vk_host_buft_device(buft)]->properties.limits.minMemoryMapAlignment;
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->suballocation_block_size;
+    return vk_instance.devices[ggml_backend_vk_host_buft_device(buft)]->suballocation_block_size;
+}
 
-    UNUSED(buft);
+static bool ggml_backend_vk_buft_is_vk_host(ggml_backend_buffer_type_t buft) {
+    return buft->iface.alloc_buffer == ggml_backend_vk_host_buffer_type_alloc_buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_dev(size_t dev_num) {
+    static std::mutex mutex;
+    static ggml_backend_vk_host_buffer_type_context ctxs[GGML_VK_MAX_DEVICES];
+    static struct ggml_backend_buffer_type bufts[GGML_VK_MAX_DEVICES];
+    static bool initialized[GGML_VK_MAX_DEVICES] = {};
+
+    GGML_ASSERT(dev_num < GGML_VK_MAX_DEVICES);
+
+    // Make sure the device is initialized
+    ggml_vk_instance_init();
+    ggml_vk_get_device(dev_num);
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!initialized[dev_num]) {
+        ctxs[dev_num].device = dev_num;
+        ctxs[dev_num].name   = dev_num == 0 ? std::string(GGML_VK_NAME "_Host") : GGML_VK_NAME + std::to_string(dev_num) + "_Host";
+        bufts[dev_num] = {
+            /* .iface    = */ {
+                /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
+                /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
+                /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
+                /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
+                /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            },
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
+            /* .context  = */ &ctxs[dev_num],
+        };
+        initialized[dev_num] = true;
+    }
+
+    return &bufts[dev_num];
 }
 
 ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
-    static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
-        /* .iface    = */ {
-            /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
-            /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
-            /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
-        },
-        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), 0),
-        /* .context  = */ nullptr,
-    };
-
-    // Make sure device 0 is initialized
-    ggml_vk_instance_init();
-    ggml_vk_get_device(0);
-
-    return &ggml_backend_vk_buffer_type_host;
+    return ggml_backend_vk_host_buffer_type_dev(0);
 }
 
 static const char * ggml_backend_vk_name(ggml_backend_t backend) {
@@ -12798,11 +12844,13 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
+static double      g_vk_slow_resync_ms = 0;
+
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || ggml_backend_vk_buft_is_vk_host(tensor->buffer->buft)) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -12861,11 +12909,17 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
     ggml_backend_vk_set_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+// GGML_VK_CPU_TIMING: reads into unpinned host memory fall back to a synchronizing copy
+static uint64_t g_vk_unpinned_reads    = 0;
+static double   g_vk_unpinned_read_ms  = 0.0;
+static size_t   g_vk_unpinned_bytes    = 0;
+static const char * g_vk_unpinned_last = nullptr;
+
 static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || ggml_backend_vk_buft_is_vk_host(tensor->buffer->buft)) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -12908,7 +12962,12 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
                 deferred_memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)ctx->sync_staging->ptr + i * size, size, &compute_ctx->out_memcpys);
             }
         }
+        const int64_t t_unp0 = ggml_time_us();
         ggml_vk_synchronize(ctx);
+        g_vk_unpinned_reads++;
+        g_vk_unpinned_read_ms += 1e-3 * (ggml_time_us() - t_unp0);
+        g_vk_unpinned_bytes   += staging_size;
+        g_vk_unpinned_last     = tensor->name;
     }
 }
 
@@ -12988,8 +13047,40 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
+// submit the work recorded so far (e.g. output reads queued after a graph) with the context fence, without
+// waiting, so it runs before work that other contexts submit next to the same queue
+static void ggml_vk_flush(ggml_backend_vk_context * ctx) {
+    if (ctx->device->serialize_submissions || ctx->flush_fence_pending || ctx->submit_pending || ctx->compute_ctx.expired()) {
+        return;
+    }
+    if (!ctx->transfer_ctx.expired() ||
+        (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value)) {
+        return;
+    }
+    vk_context compute_ctx = ctx->compute_ctx.lock();
+    if (!compute_ctx->in_memcpys.empty() || !compute_ctx->out_memcpys.empty() || compute_ctx->s == nullptr) {
+        return;
+    }
+    vk_command_buffer * cmd_buf = compute_ctx->s->buffer;
+    ggml_vk_ctx_end(compute_ctx);
+    ggml_vk_submit(compute_ctx, ctx->fence);
+    ctx->compute_ctx.reset();
+    ctx->flush_fence_pending = true;
+    ctx->flush_cmd_buf       = cmd_buf;
+}
+
 void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
+
+    if (ctx->flush_fence_pending) {
+        ggml_vk_wait_for_fence(ctx);
+        ctx->flush_fence_pending = false;
+        if (ctx->flush_cmd_buf) {
+            ctx->flush_cmd_buf->in_use = false;
+            ctx->flush_cmd_buf->buf.reset();
+            ctx->flush_cmd_buf = nullptr;
+        }
+    }
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
@@ -13059,11 +13150,104 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 }
 
+// GGML_VK_CPU_TIMING=1: per graph size class, CPU time spent recording/submitting a graph and the
+// time the following synchronize waits for the GPU (diagnostic only)
+struct ggml_vk_cpu_timing {
+    bool     enabled  = getenv("GGML_VK_CPU_TIMING") != nullptr;
+    int      last_cls = 0;
+    uint64_t n[3]     = {0, 0, 0};
+    uint64_t nodes[3] = {0, 0, 0};
+    double   rec[3]   = {0, 0, 0};
+    double   wait[3]  = {0, 0, 0};
+    double   pre[3]   = {0, 0, 0}; // host time from the last real GPU wait returning to this graph_compute
+    double   first[3] = {0, 0, 0}; // graph_compute entry to its first submit
+    int64_t  t_last_host = 0;      // last time the host returned from a sync or a graph_compute (any context)
+    int64_t  t_entry     = 0;
+    bool     first_done  = true;
+    uint64_t n_total  = 0;
+
+    static int cls_of(int n_nodes) { return n_nodes < 200 ? 0 : (n_nodes < 3000 ? 1 : 2); }
+
+    void add_graph(int n_nodes, double ms) {
+        last_cls = cls_of(n_nodes);
+        n[last_cls]++; nodes[last_cls] += n_nodes; rec[last_cls] += ms;
+        if (t_last_host != 0) { pre[last_cls] += 1e-3 * (t_entry - t_last_host); }
+        if (++n_total % 512 == 0) {
+            static const char * names[3] = { "small", "mid", "big" };
+            GGML_LOG_INFO("vk_cpu_timing: unpinned (synchronizing) reads %llu, %.3f ms total, %zu bytes, last '%s'\n",
+                    (unsigned long long) g_vk_unpinned_reads, g_vk_unpinned_read_ms, g_vk_unpinned_bytes,
+                    g_vk_unpinned_last ? g_vk_unpinned_last : "");
+            g_vk_unpinned_reads = 0; g_vk_unpinned_read_ms = 0.0; g_vk_unpinned_bytes = 0;
+            for (int c = 0; c < 3; ++c) {
+                if (n[c] == 0) continue;
+                GGML_LOG_INFO("vk_cpu_timing %s: graphs %llu, nodes %.0f, record+submit %.3f ms, sync wait %.3f ms, host before %.3f ms, entry->first submit %.3f ms\n",
+                        names[c], (unsigned long long) n[c], (double) nodes[c] / n[c], rec[c] / n[c], wait[c] / n[c], pre[c] / n[c], first[c] / n[c]);
+                n[c] = 0; nodes[c] = 0; rec[c] = 0; wait[c] = 0; pre[c] = 0; first[c] = 0;
+            }
+        }
+    }
+};
+static ggml_vk_cpu_timing g_vk_cpu_timing;
+
+
+// GGML_VK_GPU_SPAN=1: GPU time of each graph (first command to last) and the GPU idle gap before it, across all
+// contexts of the device (diagnostic only; one extra submit per graph)
+struct ggml_vk_gpu_span {
+    bool     enabled  = getenv("GGML_VK_GPU_SPAN") != nullptr;
+    uint64_t last_end = 0;
+    uint64_t n[3]     = {0, 0, 0};
+    double   span[3]  = {0, 0, 0};
+    double   gap[3]   = {0, 0, 0};
+    uint64_t n_total  = 0;
+
+    void add(int cls, uint64_t t0, uint64_t t1, double period_ns) {
+        n[cls]++;
+        span[cls] += (double) (t1 - t0) * period_ns * 1e-6;
+        if (last_end != 0 && t0 > last_end) {
+            gap[cls] += (double) (t0 - last_end) * period_ns * 1e-6;
+        }
+        last_end = t1;
+        if (++n_total % 512 == 0) {
+            static const char * names[3] = { "small", "mid", "big" };
+            double tot_span = 0, tot_gap = 0;
+            for (int c = 0; c < 3; ++c) {
+                tot_span += span[c]; tot_gap += gap[c];
+                if (n[c] == 0) continue;
+                GGML_LOG_INFO("vk_gpu_span %s: graphs %llu, gpu span %.3f ms, idle gap before %.3f ms\n",
+                        names[c], (unsigned long long) n[c], span[c] / n[c], gap[c] / n[c]);
+            }
+            GGML_LOG_INFO("vk_gpu_span: busy %.1f%% of %.1f ms\n", 100.0 * tot_span / (tot_span + tot_gap), tot_span + tot_gap);
+            for (int c = 0; c < 3; ++c) { n[c] = 0; span[c] = 0; gap[c] = 0; }
+        }
+    }
+};
+static ggml_vk_gpu_span g_vk_gpu_span;
+
+static void ggml_vk_gpu_span_read(ggml_backend_vk_context * ctx) {
+    if (!ctx->span_pending) {
+        return;
+    }
+    uint64_t ts[2] = {0, 0};
+    VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->span_pool, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "gpu span timestamps", ctx->device);
+    ctx->span_pending = false;
+    g_vk_gpu_span.add(ctx->span_cls, ts[0], ts[1], ctx->device->properties.limits.timestampPeriod);
+}
+
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    const int64_t t0 = g_vk_cpu_timing.enabled ? ggml_time_us() : 0;
     ggml_vk_synchronize(ctx);
+    if (g_vk_cpu_timing.enabled) {
+        const int64_t t1 = ggml_time_us();
+        if (t1 - t0 > 100) {
+            g_vk_cpu_timing.t_last_host = t1; // a real wait: the GPU just finished
+        }
+        g_vk_cpu_timing.wait[g_vk_cpu_timing.last_cls] += 1e-3 * (t1 - t0);
+    }
+    ggml_vk_gpu_span_read(ctx);
 
     ggml_vk_graph_cleanup(ctx);
 }
@@ -13852,6 +14036,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    const int64_t t_cpu_start = g_vk_cpu_timing.enabled ? ggml_time_us() : 0;
+    g_vk_cpu_timing.t_entry    = t_cpu_start;
+    g_vk_cpu_timing.first_done = false;
+
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
     ctx->device->diag_prev_end = -1;
@@ -13882,6 +14070,28 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     int submit_node_idx = 0; // index to first node in a batch
 
     ggml_vk_submit_transfer_ctx(ctx);
+
+    ggml_vk_gpu_span_read(ctx);
+    if (g_vk_gpu_span.enabled && !vk_perf_logger_enabled && !ctx->span_open && !ctx->span_pending) {
+        if (!ctx->span_pool) {
+            vk::QueryPoolCreateInfo qci;
+            qci.queryType  = vk::QueryType::eTimestamp;
+            qci.queryCount = 2;
+            ctx->span_pool = ctx->device->device.createQueryPool(qci);
+        }
+        ctx->device->device.resetQueryPool(ctx->span_pool, 0, 2);
+        vk_context span_ctx = ggml_vk_get_compute_ctx(ctx);
+        span_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, ctx->span_pool, 0);
+        ctx->span_open = true;
+        ctx->span_cls  = ggml_vk_cpu_timing::cls_of(cgraph->n_nodes);
+    }
+
+    {
+        // a graph may read tensors that another context's graph on this queue just wrote (e.g. a draft model
+        // reading the target model's activations): order it after all earlier work on the queue
+        vk_context first_ctx = ggml_vk_get_compute_ctx(ctx);
+        ggml_vk_sync_buffers(ctx, first_ctx);
+    }
 
     vk_context compute_ctx;
     if (vk_perf_logger_enabled) {
@@ -13966,6 +14176,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->device->diag_cgraph = cgraph;
             ctx->device->diag_prev_start = start;
             ctx->device->diag_prev_end = end;
+        }
+        if (g_vk_cpu_timing.enabled && !g_vk_cpu_timing.first_done) {
+            g_vk_cpu_timing.first_done = true;
+            g_vk_cpu_timing.first[ggml_vk_cpu_timing::cls_of(cgraph->n_nodes)] += 1e-3 * (ggml_time_us() - g_vk_cpu_timing.t_entry);
         }
         first_node_in_batch = true;
         submitted_nodes = 0;
@@ -14257,7 +14471,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+        // submit the first N nodes on their own, so the GPU starts while the rest of the graph is recorded
+        // (recording runs ahead of the GPU on decode-size graphs). GGML_VK_FIRST_SUBMIT_NODES=N, 0 disables
+        static const uint32_t first_submit_nodes = [] {
+            const char * e = getenv("GGML_VK_FIRST_SUBMIT_NODES");
+            return e ? (uint32_t) std::max(0, atoi(e)) : 12u;
+        }();
+        bool submit = (first_submit_nodes > 0 && submit_count == 0 && submitted_nodes + 1 >= first_submit_nodes) ||
+                      (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
@@ -14340,6 +14561,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         ctx->perf_logger->print_timings();
+    }
+
+    if (ctx->span_open) {
+        // end stamp in its own submit right after the graph's last batch; it runs once all of it has executed
+        vk_context span_ctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+        ggml_vk_ctx_begin(ctx->device, span_ctx);
+        span_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, ctx->span_pool, 1);
+        ggml_vk_ctx_end(span_ctx);
+        ggml_vk_submit(span_ctx, {});
+        ctx->span_open    = false;
+        ctx->span_pending = true;
+    }
+
+    if (g_vk_cpu_timing.enabled) {
+        const int64_t t_end = ggml_time_us();
+        g_vk_cpu_timing.add_graph(cgraph->n_nodes, 1e-3 * (t_end - t_cpu_start));
     }
 
     if (!ctx->device->support_async) {
@@ -14949,8 +15186,8 @@ static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_ba
 }
 
 static ggml_backend_buffer_type_t ggml_backend_vk_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    UNUSED(dev);
-    return ggml_backend_vk_host_buffer_type();
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    return ggml_backend_vk_host_buffer_type_dev(ctx->device);
 }
 
 static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_dev_t dev) {
@@ -15811,11 +16048,26 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void ggml_backend_vk_flush(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return;
+    }
+    ggml_vk_flush((ggml_backend_vk_context *) backend->context);
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_flush") == 0) {
+        return (void *) ggml_backend_vk_flush;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

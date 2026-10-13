@@ -1233,6 +1233,9 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    // ggml_backend_vk_flush submitted the recorded work with `fence`; the next synchronize waits on it
+    bool flush_fence_pending {};
+    vk_command_buffer * flush_cmd_buf {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -1282,6 +1285,12 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+
+    // for GGML_VK_GPU_SPAN: GPU timestamps at the start and the end of each graph
+    vk::QueryPool span_pool;
+    bool span_open {};    // start stamp recorded, end stamp not yet
+    bool span_pending {}; // both stamps submitted, results not read yet
+    int  span_cls {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
