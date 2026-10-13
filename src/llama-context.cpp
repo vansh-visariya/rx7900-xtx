@@ -2284,7 +2284,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        // embedding batches (e.g. images) always go to the host: their consumers read them there
+        if ((int32_t) n_tokens_all > layer_inp_host_min_tokens || batch_inp.embd != nullptr) {
+            extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -4256,6 +4259,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_embeddings_layer_inp_host_min_tokens(llama_context * ctx, int32_t n_tokens) {
+    ctx->set_embeddings_layer_inp_host_min_tokens(n_tokens);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

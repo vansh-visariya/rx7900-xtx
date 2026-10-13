@@ -919,6 +919,12 @@ static void common_speculative_on_submit() {
 }
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
+// LLAMA_DFLASH_DEV_INJECT=0 makes DFlash read the target features from the host instead of the device
+static bool dflash_dev_inject_enabled() {
+    static const bool enabled = [] { const char * e = getenv("LLAMA_DFLASH_DEV_INJECT"); return !e || atoi(e) != 0; }();
+    return enabled;
+}
+
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
 
@@ -1060,6 +1066,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
+        // token batches that fit one ubatch are injected from the target's device tensors (process()), so
+        // their features need not cross to the host (PCIe): 5 layers x n_embd floats per token
+        if (dflash_dev_inject_enabled()) {
+            llama_set_embeddings_layer_inp_host_min_tokens(ctx_tgt,
+                    (int32_t) std::min(llama_n_ubatch(ctx_tgt), llama_n_ubatch(this->params.ctx_dft)));
+        }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
@@ -1154,7 +1166,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // a batch the target decoded as a single ubatch (a verify batch) is injected from the target's device
             // tensors, so the injection is queued behind the target graph without a host round trip
             // (LLAMA_DFLASH_DEV_INJECT=0 disables)
-            static const bool dev_inject = [] { const char * e = getenv("LLAMA_DFLASH_DEV_INJECT"); return !e || atoi(e) != 0; }();
+            const bool dev_inject = dflash_dev_inject_enabled();
             if (dev_inject && has_tokens && i_batch_beg[seq_id] == 0 && n_rows == n_tokens &&
                     n_rows <= (int32_t) llama_n_ubatch(ctx_tgt) && n_rows <= n_ubatch &&
                     llama_dflash_inject_features_async(ctx_dft, ctx_tgt, target_layer_ids, (int32_t) target_layer_ids_n, n_rows)) {

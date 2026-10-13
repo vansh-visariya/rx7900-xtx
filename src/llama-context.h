@@ -121,6 +121,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_host_min_tokens(int32_t n_tokens) { layer_inp_host_min_tokens = n_tokens; }
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -392,6 +393,9 @@ private:
     // a second scheduler keeps the other graph allocated so neither is rebuilt per step. with graph_alt the
     // front graph lives in gf_res_prev[0] (with sched) and the parked one in gf_res_alt (with sched_alt)
     bool                   graph_alt = false;
+
+    // layer input embeddings are copied to the host only for batches of more tokens than this
+    int32_t layer_inp_host_min_tokens = 0;
     ggml_backend_sched_ptr sched_alt;
 
     llm_graph_result_ptr   gf_res_alt;

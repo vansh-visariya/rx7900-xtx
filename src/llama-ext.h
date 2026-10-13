@@ -110,6 +110,11 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// Copy the layer input embeddings to the host only for batches of more than n_tokens tokens; smaller batches
+// leave them on the device (for a consumer that reads them in place, e.g. llama_dflash_inject_features_async)
+// and llama_get_embeddings_layer_inp then returns stale data. 0 (default) copies every batch.
+LLAMA_API void llama_set_embeddings_layer_inp_host_min_tokens(struct llama_context * ctx, int32_t n_tokens);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);

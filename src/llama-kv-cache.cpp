@@ -1578,6 +1578,10 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
 
+    // a cache of one sequence holds only that sequence in its non-empty cells, so the per-cell sequence
+    // test (a read of the cell's bitset) can be skipped - the scan runs over every cell at long context
+    const bool single_seq = seq_to_stream.size() == 1;
+
     // the min position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
     std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
@@ -1655,7 +1659,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 // mask the token if not the same sequence
-                if (!cells.seq_has(j, seq_id)) {
+                if (!single_seq && !cells.seq_has(j, seq_id)) {
                     goto skip;
                 }
 
