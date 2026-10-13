@@ -1633,7 +1633,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmq_k, m_warptile_mmq_k, s_warptile_mmq_k,
                           l_warptile_mmqid, m_warptile_mmqid, s_warptile_mmqid,
                           l_warptile_mmqid_int, m_warptile_mmqid_int, s_warptile_mmqid_int,
-                          l_warptile_mmqid_int_k, m_warptile_mmqid_int_k, s_warptile_mmqid_int_k;
+                          l_warptile_mmqid_int_k, m_warptile_mmqid_int_k, s_warptile_mmqid_int_k,
+                          xl_warptile_mmq;
     std::array<uint32_t, 3> l_wg_denoms, m_wg_denoms, s_wg_denoms,
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
@@ -1746,6 +1747,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
+
+        // RDNA coopmat1: an extra-large quant tile, 128 x 256 with 8 subgroups, for batches of 256+ columns
+        // (prompt processing with -ub 512). A dequantized A tile serves twice the columns: 7900 XTX, 512 columns,
+        // iq3_xxs 50.4 -> 54.3 TFLOPS, iq3_s 52.9 -> 54.5, iq4_xs 53.0 -> 53.8, iq2_s 57.3 -> 56.8
+        if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->architecture != AMD_GCN &&
+                device->driver_id != vk::DriverId::eAmdProprietary) {
+            xl_warptile_mmq = { 512, 128, 256, 32, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
+        }
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
         l_align = 128;
@@ -2150,11 +2159,19 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         for (size_t i = 0; i < configs.size() && i < 3; i++) {
             if (enabled[i]) result.push_back(configs[i]);
         }
+        // extra-large tile: only next to an enabled large one, and when it fits
+        if (configs.size() > 3 && enabled[0] && enabled[1] && enabled[2] && !is_id && !is_int &&
+                ggml_vk_matmul_shmem_support(device, configs[3].warptile, false, type)) {
+            result.push_back(configs[3]);
+        }
         return result;
     };
 
     std::vector<vk_tile_config> tc_mm = {{s_warptile, s_wg_denoms, s_align}, {m_warptile, m_wg_denoms, m_align}, {l_warptile, l_wg_denoms, l_align}};
     std::vector<vk_tile_config> tc_mmq = {{s_warptile_mmq, s_mmq_wg_denoms, s_align}, {m_warptile_mmq, m_mmq_wg_denoms, m_align}, {l_warptile_mmq, l_mmq_wg_denoms, l_align}};
+    if (!xl_warptile_mmq.empty()) {
+        tc_mmq.push_back({xl_warptile_mmq, {xl_warptile_mmq[1], xl_warptile_mmq[2], 1}, l_align});
+    }
 
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     if (device->coopmat2) {
@@ -2692,6 +2709,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (m <= 32 || n <= 32) return 0;
             if (configs.size() == 2) return 1;
             if (m <= 64 || n <= 64) return 1;
+            // the extra-large tile (s, m, l, xl) only for batches that fill its columns
+            if (configs.size() > 3 && n < configs[3].unaligned->wg_denoms[1]) return 2;
             return (uint32_t)configs.size() - 1;
         };
         device->matmul_id_tile_selector = device->matmul_tile_selector;
