@@ -502,6 +502,10 @@ struct server_slot {
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
+    // accepted tokens of the last speculative cycle that are not yet streamed: they are
+    // processed while the GPU runs the next draft
+    std::vector<llama_token> spec_pending;
+
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
         if (spec_draft.empty()) {
@@ -542,6 +546,7 @@ struct server_slot {
     }
 
     void release() {
+        spec_pending.clear();
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -3045,12 +3050,59 @@ private:
             }
         });
 
+        // drop slots that stopped while streaming their deferred tokens
+        const auto drop_stopped = [&]() {
+            const auto stopped = [](server_slot * slot) { return !slot->is_processing(); };
+            for (auto * slot : drafting) {
+                if (!slot->is_processing()) {
+                    slot->spec_draft.clear();
+                    common_speculative_get_draft_params(spec.get(), slot->id).drafting = false;
+                }
+            }
+            drafting.erase(std::remove_if(drafting.begin(), drafting.end(), stopped), drafting.end());
+            generating.erase(std::remove_if(generating.begin(), generating.end(), stopped), generating.end());
+            if (slot_batched && !slot_batched->is_processing()) {
+                slot_batched = generating.empty() ? nullptr : generating.front();
+            }
+        };
+
+        // deferred tokens of slots that do not draft this cycle are streamed now
+        {
+            bool any_stopped = false;
+            for (auto * slot : generating) {
+                if (std::find(drafting.begin(), drafting.end(), slot) == drafting.end()) {
+                    any_stopped |= !flush_spec_pending(*slot);
+                }
+            }
+            if (any_stopped) {
+                drop_stopped();
+            }
+        }
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t t_draft_start = ggml_time_us();
-            queue_tasks.yield_to_queue([&]() {
-                common_speculative_draft(spec.get());
-            });
+            common_spec_trace("draft_call");
+
+            bool any_pending = false;
+            for (auto * slot : drafting) {
+                any_pending |= !slot->spec_pending.empty();
+            }
+
+            if (any_pending) {
+                // not inside yield_to_queue: streaming may release a slot, which must not race the queue worker
+                common_speculative_draft_overlap(spec.get(), [&]() {
+                    for (auto * slot : drafting) {
+                        flush_spec_pending(*slot);
+                    }
+                });
+                drop_stopped();
+            } else {
+                queue_tasks.yield_to_queue([&]() {
+                    common_speculative_draft(spec.get());
+                });
+            }
+            common_spec_trace("draft_done");
             common_spec_stats_add_time(COMMON_SPEC_STATS_T_DRAFT, 1e-3*(ggml_time_us() - t_draft_start));
         }
 
@@ -3102,6 +3154,7 @@ private:
             }
         });
 
+        common_spec_trace("ckpt_done");
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
@@ -3649,6 +3702,12 @@ private:
         }
     }
 
+    // run the speculative process step before synchronizing the target (LLAMA_DFLASH_DEV_INJECT=0 disables)
+    const bool spec_early_process = [] { const char * e = getenv("LLAMA_DFLASH_DEV_INJECT"); return !e || atoi(e) != 0; }();
+
+    // stream the accepted tokens of a speculative cycle while the next draft runs (LLAMA_SPEC_DEFER=0 disables)
+    const bool spec_defer_tokens = [] { const char * e = getenv("LLAMA_SPEC_DEFER"); return !e || atoi(e) != 0; }();
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
@@ -3691,11 +3750,25 @@ private:
 
         int ret = 0;
         const int64_t t_decode_start = ggml_time_us();
+        // the speculative process step (draft-side feature injection) can run before the target is synchronized:
+        // with device feature copies (DFlash) it is queued right behind the target graph
+        bool spec_processed = false;
+        bool spec_process_ok = true;
+
+        common_spec_trace("verify_call");
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
+            common_spec_trace("verify_submitted");
+            if (ret == 0 && spec && spec_early_process) {
+                common_spec_trace("process_call");
+                spec_process_ok = common_speculative_process(spec.get(), batch_view);
+                common_spec_trace("process_done");
+                spec_processed = true;
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            common_spec_trace("verify_synced");
         });
         if (!has_prompt) {
             common_spec_stats_add_time(COMMON_SPEC_STATS_T_DECODE, 1e-3*(ggml_time_us() - t_decode_start));
@@ -3758,10 +3831,14 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch_view);
-            });
+            bool ok = spec_process_ok;
+            if (!spec_processed) {
+                common_spec_trace("process_call");
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), batch_view);
+                });
+                common_spec_trace("process_done");
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3924,6 +4001,7 @@ private:
 
             // verify and try to accept the draft
             {
+                common_spec_trace("accept_begin");
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
@@ -3942,6 +4020,7 @@ private:
                 slot.spec_i_batch.clear();
                 common_spec_stats_add_time(COMMON_SPEC_STATS_T_ACCEPT, 1e-3*(ggml_time_us() - t_accept_start));
                 common_spec_stats_end_cycle();
+                common_spec_trace("accepted");
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -4021,30 +4100,57 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
-            for (size_t i = 0; i < ids.size(); ++i) {
-                completion_token_output result;
-
-                result.tok          = ids[i];
-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // set later
-
-                // TODO: set result.probs
-
-                slot.stats.n_gen += 1;
-
-                if (!process_token(result, slot)) {
-                    slot.print_timings();
-                    send_final_response(slot);
-                    slot.release();
-
-                    return;
-                }
+            if (spec_defer_tokens) {
+                // stream these while the next draft runs on the GPU (see pre_decode)
+                slot.spec_pending = ids;
+                common_spec_trace("tokens_sent");
+                return;
             }
 
-            slot.print_timings_tg();
+            slot.spec_pending = ids;
+            if (!flush_spec_pending(slot)) {
+                return;
+            }
+
+            common_spec_trace("tokens_sent");
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+    }
+
+    // stream the accepted tokens of the last speculative cycle; returns false if the slot stopped (and was released)
+    bool flush_spec_pending(server_slot & slot) {
+        if (slot.spec_pending.empty()) {
+            return slot.is_processing();
+        }
+        const auto ids = std::move(slot.spec_pending);
+        slot.spec_pending.clear();
+
+        for (size_t i = 0; i < ids.size(); ++i) {
+            completion_token_output result;
+
+            result.tok          = ids[i];
+            const bool special = params_base.special ||
+                slot.task->params.sampling.preserved_tokens.find(result.tok) != slot.task->params.sampling.preserved_tokens.end();
+            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, special);
+            result.prob         = 1.0f; // set later
+
+            // TODO: set result.probs
+
+            slot.stats.n_gen += 1;
+
+            if (!process_token(result, slot)) {
+                slot.print_timings();
+                send_final_response(slot);
+                slot.release();
+
+                return false;
+            }
+        }
+
+        slot.print_timings_tg();
+
+        return true;
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model

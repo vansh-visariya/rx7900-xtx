@@ -1,3 +1,6 @@
+#include <ctime>
+#include <map>
+#include <cstring>
 #include "sampling.h"
 
 #include "common.h"
@@ -684,7 +687,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
 namespace {
 void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const std::vector<int> & idxs,
-        const llama_tokens & draft, const std::vector<llama_token> & result);
+        const llama_tokens & draft, const std::vector<llama_token> & result,
+        const std::vector<std::vector<llama_token_data>> * draft_q = nullptr);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
@@ -840,7 +844,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
         result.push_back(z);
 
         if (common_spec_stats_enabled()) {
-            spec_stats_record_verify(gsmpl, ctx, idxs, draft, result);
+            spec_stats_record_verify(gsmpl, ctx, idxs, draft, result, &draft_q);
         }
 
         return result;
@@ -854,7 +858,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
     result.push_back(id);
 
     if (common_spec_stats_enabled()) {
-        spec_stats_record_verify(gsmpl, ctx, idxs, draft, result);
+        spec_stats_record_verify(gsmpl, ctx, idxs, draft, result, &draft_q);
     }
 
     return result;
@@ -1103,6 +1107,12 @@ struct spec_stats {
 
     double t_ms[COMMON_SPEC_STATS_T_COUNT] = {};
 
+    // LLAMA_SPEC_TEMPS=0.5,0.7,1.0: re-weight the kept draft candidates (their raw logits) at each listed
+    // temperature and average sum_x min(p(x), q_T(x)) on the same drafted path (rejection verification only)
+    std::vector<float>  temps;
+    std::vector<double> sum_ov_t; // [temps.size() * N_POS]
+    int64_t n_eval_t[N_POS] = {};
+
     spec_stats() {
         const char * env = getenv("LLAMA_SPEC_STATS");
         if (env && atoi(env) != 0) {
@@ -1110,6 +1120,13 @@ struct spec_stats {
             if (atoi(env) > 1) {
                 interval = atoi(env);
             }
+        }
+        const char * env_t = getenv("LLAMA_SPEC_TEMPS");
+        if (enabled && env_t) {
+            for (const auto & t : string_split<std::string>(env_t, ',')) {
+                temps.push_back(std::stof(t));
+            }
+            sum_ov_t.assign(temps.size() * N_POS, 0.0);
         }
     }
 
@@ -1135,6 +1152,17 @@ struct spec_stats {
         LOG_INF("spec-stats:   mean p(draft)  /pos    : %s-> model len %.3f (exact match)\n", s_pex.c_str(), len_ex);
         LOG_INF("spec-stats:   mean sum min(p,q)/pos  : %s-> model len %.3f (rejection sampling)\n", s_ov.c_str(), len_rej);
 
+        for (size_t t = 0; t < temps.size(); ++t) {
+            std::string s_t_ov;
+            double len_t = 1.0, prod_t = 1.0;
+            for (int k = 0; k < N_POS && n_eval_t[k] > 0; ++k) {
+                const double ov = sum_ov_t[t * N_POS + k] / n_eval_t[k];
+                prod_t *= ov; len_t += prod_t;
+                s_t_ov += string_format("%.3f ", ov);
+            }
+            LOG_INF("spec-stats:   draft temp %.2f sum min(p,q_T)/pos : %s-> model len %.3f\n", temps[t], s_t_ov.c_str(), len_t);
+        }
+
         std::string s_t;
         for (int k = 0; k < COMMON_SPEC_STATS_T_COUNT; ++k) {
             s_t += string_format("%s %.2f ms  ", t_names[k], n_cycles_t > 0 ? t_ms[k] / n_cycles_t : 0.0);
@@ -1149,7 +1177,8 @@ spec_stats & g_spec_stats() {
 }
 
 void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const std::vector<int> & idxs,
-        const llama_tokens & draft, const std::vector<llama_token> & result) {
+        const llama_tokens & draft, const std::vector<llama_token> & result,
+        const std::vector<std::vector<llama_token_data>> * draft_q) {
     auto & st = g_spec_stats();
 
     if (st.replay) {
@@ -1173,9 +1202,17 @@ void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const
             continue;
         }
 
+        // the draft's own q (rejection verification) takes precedence over the MTP stats copy
+        std::vector<std::pair<llama_token, float>> q_own;
+        if (draft_q && i < draft_q->size()) {
+            for (const auto & e : (*draft_q)[i]) {
+                q_own.emplace_back(e.id, e.p);
+            }
+        }
+
         double pex = 0.0;
         double ov  = 0.0;
-        const auto * q = i < st.q.size() ? &st.q[i] : nullptr;
+        const auto * q = !q_own.empty() ? &q_own : (i < st.q.size() ? &st.q[i] : nullptr);
         for (size_t j = 0; j < cur_p->size; ++j) {
             const double p = cur_p->data[j].p / psum;
             if (cur_p->data[j].id == draft[i]) {
@@ -1194,6 +1231,33 @@ void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const
         st.n_eval [i]++;
         st.sum_pex[i] += pex;
         st.sum_ov [i] += q ? ov : pex;
+
+        if (!st.temps.empty() && draft_q && i < draft_q->size() && !(*draft_q)[i].empty()) {
+            const auto & dq = (*draft_q)[i];
+            float max_l = dq[0].logit;
+            for (const auto & e : dq) {
+                max_l = std::max(max_l, e.logit);
+            }
+            for (size_t t = 0; t < st.temps.size(); ++t) {
+                const double inv_t = 1.0 / std::max(st.temps[t], 1e-3f);
+                double sum = 0.0;
+                for (const auto & e : dq) {
+                    sum += exp((e.logit - max_l) * inv_t);
+                }
+                double ov_t = 0.0;
+                for (const auto & e : dq) {
+                    const double qt = exp((e.logit - max_l) * inv_t) / sum;
+                    for (size_t j = 0; j < cur_p->size; ++j) {
+                        if (cur_p->data[j].id == e.id) {
+                            ov_t += std::min((double) cur_p->data[j].p / psum, qt);
+                            break;
+                        }
+                    }
+                }
+                st.sum_ov_t[t * spec_stats::N_POS + i] += ov_t;
+            }
+            st.n_eval_t[i]++;
+        }
     }
 
     // observed exact-match acceptance per position
@@ -1269,5 +1333,57 @@ void common_spec_stats_end_cycle() {
     st.n_cycles_t++;
     if (st.n_cycles_t % st.interval == 0) {
         st.print();
+    }
+}
+
+void common_spec_trace(const char * label) {
+    static const int interval = [] { const char * e = getenv("LLAMA_SPEC_TRACE"); return e ? atoi(e) : 0; }();
+    if (interval <= 0) {
+        return;
+    }
+    struct acc { double sum = 0; uint64_t n = 0; int order; double cpu = 0; std::vector<float> v; };
+    static std::map<std::string, acc> accs;
+    static const char * prev  = nullptr;
+    static int64_t      t_prev = 0;
+    static uint64_t     n_cyc  = 0;
+    static int          n_order = 0;
+    static int64_t      c_prev = 0;
+
+    const int64_t t = ggml_time_us();
+    timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    const int64_t c = (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    if (prev) {
+        const std::string key = std::string(prev) + " -> " + label;
+        auto it = accs.find(key);
+        if (it == accs.end()) {
+            it = accs.emplace(key, acc{0, 0, n_order++}).first;
+        }
+        it->second.sum += 1e-3 * (t - t_prev);
+        it->second.v.push_back(1e-3f * (t - t_prev));
+        it->second.cpu += 1e-3 * (c - c_prev);
+        it->second.n++;
+    }
+    prev = label;
+    t_prev = t;
+    c_prev = c;
+
+    if (strcmp(label, "verify_call") == 0 && ++n_cyc % interval == 0) {
+        std::vector<std::pair<int, std::string>> order;
+        for (auto & kv : accs) {
+            order.push_back({kv.second.order, kv.first});
+        }
+        std::sort(order.begin(), order.end());
+        double tot = 0;
+        for (auto & o : order) {
+            auto & a = accs[o.second];
+            std::sort(a.v.begin(), a.v.end());
+            const double med = a.v.empty() ? 0.0 : a.v[a.v.size() / 2];
+            LOG_INF("spec-trace: %-34s median %7.3f ms, mean %7.3f ms/cycle, thread cpu %7.3f (%.2f per cycle)\n", o.second.c_str(), med, a.sum / interval, a.cpu / interval, (double) a.n / interval);
+            if ((double) a.n / interval > 0.5) { tot += med; }
+        }
+        LOG_INF("spec-trace: sum of medians (steps seen > 0.5 per cycle) %.3f ms\n", tot);
+        accs.clear();
+        n_order = 0;
     }
 }

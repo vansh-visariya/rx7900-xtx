@@ -907,6 +907,17 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// set by common_speculative_draft_overlap for the duration of one draft call
+static std::function<void()> g_draft_on_submit;
+
+static void common_speculative_on_submit() {
+    if (g_draft_on_submit) {
+        auto f = std::move(g_draft_on_submit);
+        g_draft_on_submit = nullptr;
+        f();
+    }
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -929,6 +940,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
+
+    std::vector<std::mt19937> rngs; // DFlash2 draft-q sampling (rejection-sampling verification)
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
@@ -1138,6 +1151,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            // a batch the target decoded as a single ubatch (a verify batch) is injected from the target's device
+            // tensors, so the injection is queued behind the target graph without a host round trip
+            // (LLAMA_DFLASH_DEV_INJECT=0 disables)
+            static const bool dev_inject = [] { const char * e = getenv("LLAMA_DFLASH_DEV_INJECT"); return !e || atoi(e) != 0; }();
+            if (dev_inject && has_tokens && i_batch_beg[seq_id] == 0 && n_rows == n_tokens &&
+                    n_rows <= (int32_t) llama_n_ubatch(ctx_tgt) && n_rows <= n_ubatch &&
+                    llama_dflash_inject_features_async(ctx_dft, ctx_tgt, target_layer_ids, (int32_t) target_layer_ids_n, n_rows)) {
+                batch_inject.n_tokens = n_rows;
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const llama_pos p = batch_in.pos[i];
+                    batch_inject.pos[i] = p;
+                    if (is_mrope) {
+                        batch_inject.pos[1 * n_rows + i] = p;
+                        batch_inject.pos[2 * n_rows + i] = p;
+                        batch_inject.pos[3 * n_rows + i] = 0;
+                    }
+                    batch_inject.n_seq_id[i]  = 1;
+                    batch_inject.seq_id[i][0] = seq_id;
+                    batch_inject.logits[i]    = false;
+                }
+                // submit the target's queued output reads first, so a sync of the target does not also wait
+                // for the injection
+                llama_flush(ctx_tgt);
+                common_spec_trace("inject_call");
+                const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                common_spec_trace("inject_submitted");
+                llama_dflash_inject_features_clear(ctx_dft);
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, device features)\n", __func__, rc, (int) n_rows);
+                    return false;
+                }
+                continue;
+            }
+
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
@@ -1168,7 +1215,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                common_spec_trace("inject_call");
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                common_spec_trace("inject_submitted");
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1197,6 +1246,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             common_sampler_reset(smpls[seq_id].get());
+            dp.q.clear();
 
             const int32_t n = (int32_t) dp.pos0;
 
@@ -1215,7 +1265,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        common_spec_trace("dft_decode_call");
         int ret = llama_decode(ctx_dft, batch);
+        common_spec_trace("dft_decode_submitted");
+        common_speculative_on_submit();
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -1238,20 +1291,56 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                if (dp.sample_q && rngs.size() < n_seq) {
+                    for (uint32_t s = rngs.size(); s < n_seq; ++s) {
+                        rngs.emplace_back(0xdf1a5u + s);
+                    }
+                }
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
-                    predecessor = (int32_t) std::distance(scores,
+                    const int32_t i_max = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
+                    predecessor = i_max;
+                    if (dp.sample_q) {
+                        // rejection-sampling verification: sample the candidate from q = softmax(scores / temp)
+                        // and keep q; the selector scores are conditioned on the sampled predecessor
+                        const float inv_t = 1.0f / std::max(dp.temp_q, 1e-3f);
+                        auto & q = dp.q.emplace_back();
+                        q.resize(selector_top_k);
+                        double sum = 0.0;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            const double e = std::exp((double) (scores[k] - scores[i_max]) * inv_t);
+                            q[k] = { (llama_token) row[k], scores[k], (float) e };
+                            sum += e;
+                        }
+                        std::uniform_real_distribution<double> unif(0.0, 1.0);
+                        double u = unif(rngs[seq_id])*sum;
+                        predecessor = selector_top_k - 1;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            u -= q[k].p;
+                            if (u <= 0.0) {
+                                predecessor = k;
+                                break;
+                            }
+                        }
+                        for (auto & e : q) {
+                            e.p = (float) (e.p / sum);
+                        }
+                    }
                     if (params.p_min > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
-                            sum += std::exp(scores[k] - scores[predecessor]);
+                            sum += std::exp(scores[k] - scores[i_max]);
                         }
                         if (1.0f / sum < params.p_min) {
+                            if (dp.sample_q) {
+                                dp.q.pop_back();
+                            }
                             break;
                         }
                     }
@@ -1260,6 +1349,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                    dp.q.clear();
                 }
                 continue;
             }
@@ -2853,6 +2943,12 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     return result;
+}
+
+void common_speculative_draft_overlap(common_speculative * spec, const std::function<void()> & on_submit) {
+    g_draft_on_submit = on_submit;
+    common_speculative_draft(spec);
+    common_speculative_on_submit();
 }
 
 void common_speculative_draft(common_speculative * spec) {

@@ -167,3 +167,5 @@ void common_spec_stats_set_replay(bool is_replay);
 void common_spec_stats_add_time(enum common_spec_stats_time kind, double ms);
 // counts one completed generation cycle and prints the cumulative summary every N cycles
 void common_spec_stats_end_cycle();
+// LLAMA_SPEC_TRACE=N: host timeline of the spec loop; prints the mean time between consecutive marks every N cycles
+void common_spec_trace(const char * label);

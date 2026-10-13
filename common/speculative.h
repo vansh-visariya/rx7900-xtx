@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "llama.h"
 #include "common.h"
 
@@ -88,6 +90,11 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
+
+// same as common_speculative_draft, but calls on_submit once the draft model's first decode has been submitted
+// to the GPU (before waiting for it), so host work can overlap the draft; on_submit runs at the latest when
+// the draft returns
+void common_speculative_draft_overlap(common_speculative * spec, const std::function<void()> & on_submit);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
