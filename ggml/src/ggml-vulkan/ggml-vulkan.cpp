@@ -8067,10 +8067,17 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // 128 rows) when the head sizes allow it, else 4 (GGML_VK_FA_GQA_SG=4|8 forces one).
     static const bool gqa_shader_enabled = [] { const char * e = getenv("GGML_VK_FA_GQA_SHADER"); return !e || atoi(e) != 0; }();
     static const uint32_t gqa_sg_forced = [] { const char * e = getenv("GGML_VK_FA_GQA_SG"); return e ? (uint32_t) atoi(e) : 0u; }();
+    // subgroup size of the GQA shader: 32 on AMD when the device can run it (7900 XTX, q8_0 KV: 5 tokens at 64K
+    // 334 -> 303 us, 512 tokens 28 -> 33 TFLOPS), else the default. GGML_VK_FA_GQA_WAVE=N forces N
+    static const uint32_t gqa_wave_env = [] { const char * e = getenv("GGML_VK_FA_GQA_WAVE"); return e ? (uint32_t) atoi(e) : 0u; }();
+    const uint32_t gqa_wave = gqa_wave_env ? gqa_wave_env : (ctx->device->vendor_id == VK_VENDOR_ID_AMD ? 32u : 0u);
+    const uint32_t gqa_sgs = (gqa_wave && ctx->device->subgroup_size_control &&
+                              ctx->device->subgroup_min_size <= gqa_wave && gqa_wave <= ctx->device->subgroup_max_size)
+                             ? gqa_wave : ctx->device->subgroup_size;
     if (gqa_shader_enabled && gqa_ratio > 1 && tuning_params.path == FA_COOPMAT1 && !use_sparse &&
         k_type_eff != GGML_TYPE_BF16 && v_type_eff != GGML_TYPE_BF16 &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
-        ctx->device->subgroup_size >= 16 && ctx->device->subgroup_size <= 64 && N <= 32) {
+        gqa_sgs >= 16 && gqa_sgs <= 64 && N <= 32) {
         const uint32_t gqa_br = N > 16 ? 32 : 16;
         uint32_t num_sg = 0;
         for (uint32_t sg : { 8u, 4u }) {
@@ -8079,9 +8086,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 continue;
             }
             const uint32_t kch = sg >= 8 ? 32 : 64;
-            const uint32_t wg  = sg * ctx->device->subgroup_size;
-            if (HSK % kch == 0 && HSV % (16 * sg) == 0 && wg / gqa_br <= ctx->device->subgroup_size &&
-                (16 * kch / 4) % ctx->device->subgroup_size == 0 && (16 * HSV / sg / 4) % ctx->device->subgroup_size == 0 &&
+            const uint32_t wg  = sg * gqa_sgs;
+            if (HSK % kch == 0 && HSV % (16 * sg) == 0 && wg / gqa_br <= gqa_sgs &&
+                (16 * kch / 4) % gqa_sgs == 0 && (16 * HSV / sg / 4) % gqa_sgs == 0 &&
                 wg <= ctx->device->properties.limits.maxComputeWorkGroupSize[0] &&
                 ggml_vk_flash_attn_gqa_shmem_support(ctx->device, gqa_br, sg, HSK, HSV, f32acc)) {
                 num_sg = sg;
@@ -8094,8 +8101,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             tuning_params.block_cols     = 16 * num_sg;
             tuning_params.row_split      = num_sg;
             tuning_params.d_split        = 1;
-            tuning_params.subgroup_size  = ctx->device->subgroup_size;
-            tuning_params.workgroup_size = num_sg * ctx->device->subgroup_size;
+            tuning_params.subgroup_size  = gqa_sgs;
+            tuning_params.workgroup_size = num_sg * gqa_sgs;
             tuning_params.shmem_staging  = 0;
             tuning_params.limit_occupancy_shmem = 0;
         }
