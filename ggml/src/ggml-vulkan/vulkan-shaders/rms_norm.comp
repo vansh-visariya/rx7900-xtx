@@ -36,12 +36,39 @@ layout (binding = 4) readonly buffer E {float data_e[];};
 
 layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 
+#elif RMS_NORM_MUL_FUSION
+
+layout (binding = 3) readonly buffer C {float data_c[];};
+
+#endif
+
+#if RMS_NORM_Q8_1
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// q8_1 copy of the output for the next integer-dot mat-vec (x4 block layout of quantize_q8_1). The row is staged in
+// shared memory, then quantized like quantize_q8_1: a vec4 per invocation, 8 invocations per 32-value block
+#if RMS_NORM_MUL_FUSION
+layout (binding = 4) writeonly buffer Q {block_q8_1_x4 data_q[];};
+#else
+layout (binding = 3) writeonly buffer Q {block_q8_1_x4 data_q[];};
+#endif
+
+// widest row the staging buffer holds (a specialization constant, so narrow rows keep a small LDS footprint)
+layout (constant_id = 3) const uint Q8_1_MAX_COLS = 8192;
+shared vec4 rowsh[Q8_1_MAX_COLS / 4];
+
+
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
 #define BLOCK_SIZE 512
 
 layout (constant_id = 1) const bool do_multiply = false;
+// RMS_NORM + SCALE: multiply the normalized value by p.param2 (the scale op's factor, its bias is zero)
+layout (constant_id = 4) const bool do_scale = false;
 #if RMS_NORM_ADD_FUSION
 layout (constant_id = 2) const bool do_post_multiply = false;
 #endif
@@ -49,6 +76,27 @@ layout (constant_id = 2) const bool do_post_multiply = false;
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+
+#if RMS_NORM_Q8_1
+void store_q8_1_row(const uint e0, const uint ncols, const uint tid) {
+    barrier();
+    for (uint v = tid; v < ncols / 4; v += BLOCK_SIZE) {
+        const vec4 vals = rowsh[v];
+        const vec4 abs_vals = abs(vals);
+        const float amax = subgroupClusteredMax(max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w)), 8);
+        const float d = amax / 127.0;
+        const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+        const vec4 q = round(vals * d_inv);
+        const float sum = subgroupClusteredAdd(q.x + q.y + q.z + q.w, 8);
+        const uint e = e0 + 4 * v;
+        const uint ib = e / 32;
+        data_q[ib / 4].qs[(ib % 4) * 8 + (e % 32) / 4] = pack32(i8vec4(q));
+        if (e % 32 == 0) {
+            data_q[ib / 4].ds[ib % 4] = f16vec2(vec2(d, sum * d));
+        }
+    }
+}
+#endif
 
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
@@ -120,6 +168,12 @@ void rms_norm(uint num_iters) {
                     continue;
                 }
                 FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]);
+#if RMS_NORM_MUL_FUSION
+                value *= FLOAT_TYPE(data_c[d_offset + col]);
+#endif
+#if RMS_NORM_Q8_1
+                rowsh[col / 4][col % 4] = float(value);
+#endif
 #if RMS_NORM_ADD_FUSION
                 value += FLOAT_TYPE(data_c[d_offset + col]);
                 if (do_post_multiply) {
@@ -134,9 +188,16 @@ void rms_norm(uint num_iters) {
             if (col >= ncols) {
                 continue;
             }
-            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+            FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]);
+            if (do_scale) {
+                value *= FLOAT_TYPE(p.param2);
+            }
+            data_d[d_offset + col] = D_TYPE(value);
         }
     }
+#if RMS_NORM_Q8_1
+    store_q8_1_row(((samp*nchannels + channel)*nrows + row)*ncols, ncols, tid);
+#endif
 #if RMS_NORM_ROPE_FUSION
     barrier();
     rope_params rp = p.rope;

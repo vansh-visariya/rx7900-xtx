@@ -9,6 +9,14 @@ layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 layout (binding = 1) readonly buffer B {A_TYPE data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
+#if GLU_Q8_1
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#include "types.glsl"
+// q8_1 copy of the output for the next integer-dot mat-vec (x4 block layout of quantize_q8_1)
+layout (binding = 3) writeonly buffer Q {block_q8_1_x4 data_q[];};
+#endif
+
 layout (push_constant) uniform parameter
 {
     uint N;

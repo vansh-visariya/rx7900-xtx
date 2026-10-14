@@ -6938,6 +6938,188 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// delta-net q/k L2 norm as built by the models: scale(rms_norm(x, eps / n), 1 / sqrt(n))
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne) : ne(ne) {}
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        const float n = ne[0];
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, x, 1e-6f / n), 1.0f / sqrtf(n));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// gated output norm of a delta-net layer: rms_norm(x) * w * silu(z) per head, optionally into a mat-vec
+struct test_rms_norm_mul_gate : public test_case {
+    const ggml_type type;
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n;
+    const bool mat;
+
+    test_rms_norm_mul_gate(ggml_type type, int64_t head_dim, int64_t n_head, int64_t n, bool mat)
+        : type(type), head_dim(head_dim), n_head(n_head), n(n), mat(mat) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, head_dim, n_head, n, mat);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n);
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor * g = ggml_silu(ctx, z);
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), g);
+        if (mat) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type, head_dim * n_head, 64);
+            out = ggml_mul_mat(ctx, a, ggml_reshape_2d(ctx, out, head_dim * n_head, n));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// FFN on a few columns: gate/up mat-vecs, SWIGLU, down mat-vec (the swiglu output feeds a mat-vec)
+struct test_ffn_swiglu_mat : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int64_t n;
+
+    test_ffn_swiglu_mat(ggml_type type, int64_t n_embd, int64_t n_ff, int64_t n)
+        : type(type), n_embd(n_embd), n_ff(n_ff), n(n) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_embd, n_ff, n);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FFN_SWIGLU_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n);
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, type, n_ff, n_embd);
+        ggml_tensor * h  = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, wg, x), ggml_mul_mat(ctx, wu, x));
+        ggml_tensor * out = ggml_mul_mat(ctx, wd, h);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// RMS_NORM + MUL feeding mat-vecs of a few columns (the normalized input of attention / FFN projections)
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool two_consumers;
+
+    test_rms_norm_mul_mat(ggml_type type, int64_t m, int64_t n, int64_t k, bool two_consumers)
+        : type(type), m(m), n(n), k(k), two_consumers(two_consumers) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, n, k, two_consumers);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
+        if (two_consumers) {
+            ggml_tensor * a2 = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * f  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 16);
+            out = ggml_add(ctx, out, ggml_mul_mat(ctx, a2, cur));
+            out = ggml_concat(ctx, out, ggml_mul_mat(ctx, f, cur), 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_MUL_MAT + GGML_OP_ADD of a full-shape addend (a residual) on a few columns
+struct test_mul_mat_add_residual : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    test_mul_mat_add_residual(ggml_type type, int64_t m, int64_t n, int64_t k)
+        : type(type), m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ADD_RESIDUAL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a, b), r);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10958,6 +11140,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+        }
+    }
+
+    for (std::array<int64_t, 4> ne : {std::array<int64_t, 4>{128, 32, 5, 1}, {128, 32, 1, 1}, {256, 8, 3, 2}, {4096, 2, 1, 1}}) {
+        test_cases.emplace_back(new test_rms_norm_scale(ne));
+    }
+
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {
+        for (int64_t n : {1, 2, 5, 8}) {
+            for (bool mat : {false, true}) {
+                test_cases.emplace_back(new test_rms_norm_mul_gate(type, 128, 16, n, mat));
+            }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {
+        for (int64_t n : {1, 2, 5, 8}) {
+            for (int64_t n_ff : {1024, 800}) {
+                test_cases.emplace_back(new test_ffn_swiglu_mat(type, 256, n_ff, n));
+            }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S}) {
+        for (int64_t n : {1, 2, 5, 8}) {
+            for (bool two : {false, true}) {
+                test_cases.emplace_back(new test_rms_norm_mul_mat(type, 96, n, 2560, two));
+            }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S}) {
+        for (int64_t n : {1, 2, 5, 8, 9}) {
+            test_cases.emplace_back(new test_mul_mat_add_residual(type, 256, n, 512));
         }
     }
 
