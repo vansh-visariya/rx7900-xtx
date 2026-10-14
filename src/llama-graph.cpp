@@ -3539,6 +3539,9 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
+    // kept allocated for the whole graph: a backend may read the state rows where the gathered state is used
+    // instead of running the gather (the Vulkan gated_delta_net reads its state from the cache)
+    ggml_set_output(inp->s_copy);
     ggml_set_name(inp->s_copy, "rs_s_copy");
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
