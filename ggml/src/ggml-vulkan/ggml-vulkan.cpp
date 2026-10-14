@@ -7896,10 +7896,10 @@ static bool ggml_vk_flash_attn_gqa_shmem_support(const vk_device& device, uint32
     const uint32_t Bc      = 16 * num_sg;
     const uint32_t kch     = num_sg >= 8 ? 32 : 64;
 
-    const uint32_t Qf   = Br * (hsk / 4 + 2) * f16vec4;
+    const uint32_t Qf   = Br * (hsk / 8 + 1) * 16;
     const uint32_t sfsh = Bc * (Br + 4) * acc;
-    const uint32_t Psh  = Bc * (Br + 8) * 2;
-    const uint32_t stg  = num_sg * 16 * (std::max(kch, hsv / num_sg) / 4 + 2) * f16vec4;
+    const uint32_t Psh  = Br * (Bc / 4 + 2) * f16vec4;
+    const uint32_t stg  = num_sg * std::max(16 * (kch / 8 + 1), (hsv / num_sg) * (16 / 8 + 1)) * 16;
     const uint32_t diag = Br * 16 * acc;
     const uint32_t rowf = Br * 4;
     // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally, so its shared table is always allocated.
@@ -8087,8 +8087,17 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             }
             const uint32_t kch = sg >= 8 ? 32 : 64;
             const uint32_t wg  = sg * gqa_sgs;
-            if (HSK % kch == 0 && HSV % (16 * sg) == 0 && wg / gqa_br <= gqa_sgs &&
-                (16 * kch / 4) % gqa_sgs == 0 && (16 * HSV / sg / 4) % gqa_sgs == 0 &&
+            // q8_0 K/V load in 8-quant octets: 32-dim blocks per subgroup and 4-byte aligned rows
+            const bool k_oct_ok = k_type_eff != GGML_TYPE_Q8_0 ||
+                                  (gqa_sgs % (kch / 8) == 0 && (16 * kch / 8) % gqa_sgs == 0 &&
+                                   nbk1 % 4 == 0 && nbk2 % 4 == 0 && nbk3 % 4 == 0);
+            // V^T is staged in pairs of rows, so a lane needs at least 2 consecutive V rows
+            const bool v_oct_ok = v_type_eff != GGML_TYPE_Q8_0 ||
+                                  ((HSV / sg) % 32 == 0 && gqa_sgs % (HSV / sg / 8) == 0 && 16 * (HSV / sg / 8) >= 2 * gqa_sgs &&
+                                   nbv1 % 4 == 0 && nbv2 % 4 == 0 && nbv3 % 4 == 0);
+            const bool v_rows_ok = v_type_eff == GGML_TYPE_Q8_0 || 16 * (HSV / sg / 4) >= 2 * gqa_sgs;
+            if (HSK % kch == 0 && HSV % (16 * sg) == 0 && wg / gqa_br <= gqa_sgs && k_oct_ok && v_oct_ok && v_rows_ok &&
+                (16 * kch / 4) % gqa_sgs == 0 && (16 * HSV / sg / 4) % gqa_sgs == 0 && gqa_sgs % (HSV / sg / 4) == 0 &&
                 wg <= ctx->device->properties.limits.maxComputeWorkGroupSize[0] &&
                 ggml_vk_flash_attn_gqa_shmem_support(ctx->device, gqa_br, sg, HSK, HSV, f32acc)) {
                 num_sg = sg;

@@ -11633,6 +11633,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // the verify at long-context depths
+    for (int kv : { 131072, 262144, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+    }
     // the same model's prompt processing at depth (ubatch 128 / 512)
     for (int kv : { 16384, 65536, }) {
         for (int nb : { 128, 512, }) {
