@@ -1126,6 +1126,7 @@ vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buff
 //   GGML_VK_FUSE_Q8_1=0     producers do not write the q8_1 copy for the next integer mat-vec
 //   GGML_VK_FUSE_MMV_ADD=0  no residual ADD fusion into mat-vecs of 2-8 columns
 //   GGML_VK_FUSE_GDN_STATE=0  gated_delta_net reads a gathered copy of its state instead of the cache row
+//   GGML_VK_FUSE_CONV_STATE=0 the conv state path of recurrent layers runs as separate nodes
 //   GGML_VK_SKIP_OPS=OP[:src0type],...  diagnostic: skip matching nodes (and their fused followers) to measure their
 //                           in-graph cost, results are wrong while set. QUANTIZE_Q8_1 skips the mat-vec input quantize
 struct ggml_vk_ab_env {
@@ -1135,6 +1136,7 @@ struct ggml_vk_ab_env {
     bool                     fuse_q8_1     = true;
     bool                     fuse_mmv_add  = true;
     bool                     fuse_gdn_state = true;
+    bool                     fuse_conv_state = true;
 
     void refresh() {
         const char * e = getenv("GGML_VK_SKIP_OPS");
@@ -1160,6 +1162,8 @@ struct ggml_vk_ab_env {
         fuse_mmv_add = !ma || atoi(ma) != 0;
         const char * gs = getenv("GGML_VK_FUSE_GDN_STATE");
         fuse_gdn_state = !gs || atoi(gs) != 0;
+        const char * cs = getenv("GGML_VK_FUSE_CONV_STATE");
+        fuse_conv_state = !cs || atoi(cs) != 0;
     }
 };
 static ggml_vk_ab_env g_vk_ab;
@@ -3622,6 +3626,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_state_f32,     "ssm_conv_state_f32",     ssm_conv_state_f32_len, ssm_conv_state_f32_data, "main", 6, sizeof(vk_op_ssm_conv_state_push_constants), {64, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -10243,6 +10248,38 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     });
 }
 
+static void ggml_vk_ssm_conv_state(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_conv_state_fusion & f) {
+    const ggml_tensor * cache = f.rows->src[0];
+    const ggml_tensor * idx   = f.rows->src[1];
+    const ggml_tensor * kern  = f.conv->src[1];
+    const ggml_tensor * dst   = f.silu;
+
+    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_state_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_ssm_conv_state_push_constants pc = {};
+    pc.nr   = (uint32_t)f.x->ne[0];
+    pc.n_t  = (uint32_t)f.x->ne[1];
+    pc.n_s  = (uint32_t)f.x->ne[2];
+    pc.row  = (uint32_t)(cache->nb[1] / sizeof(float));
+    pc.xs1  = (uint32_t)(f.x->nb[1] / sizeof(float));
+    pc.xs2  = (uint32_t)(f.x->nb[2] / sizeof(float));
+    pc.ds1  = (uint32_t)(dst->nb[1] / sizeof(float));
+    pc.ds2  = (uint32_t)(dst->nb[2] / sizeof(float));
+    pc.ks1  = (uint32_t)(kern->nb[1] / sizeof(float));
+    pc.n_snap = (uint32_t)f.cpys.size();
+    for (size_t k = 0; k < f.cpys.size(); ++k) {
+        (k < 4 ? pc.snap_src0 : pc.snap_src1) |= f.snap_src[k] << (8 * (k % 4));
+        pc.snap_row[k] = f.snap_row[k];
+    }
+
+    vk_subbuffer cache_buf = ggml_vk_tensor_subbuffer(ctx, cache);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { cache_buf, ggml_vk_tensor_subbuffer(ctx, idx), ggml_vk_tensor_subbuffer(ctx, f.x),
+          ggml_vk_tensor_subbuffer(ctx, kern), ggml_vk_tensor_subbuffer(ctx, dst), cache_buf },
+        pc, { pc.nr, pc.n_s, 1 });
+}
+
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * g = dst->src[1];
@@ -12202,6 +12239,132 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     }
 }
 
+// a recurrent layer's conv state path at its concat (vk_conv_state_fusion): concat(reshape(get_rows(cache, idx)),
+// transpose(x)) used only by views of the state windows, each copied into a cache row, and by ssm_conv + silu. The
+// kernel runs at the concat and writes the silu output there, so that output must not alias x, which is read there.
+// Small batches only (the kernel loops over the tokens).
+static bool ggml_vk_match_conv_state(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                     vk_conv_state_fusion & f) {
+    const ggml_tensor * cat = cgraph->nodes[node_idx];
+    if (!g_vk_ab.fuse_conv_state || cat->op != GGML_OP_CONCAT || cat->type != GGML_TYPE_F32 ||
+        ggml_get_op_params_i32(cat, 0) != 0 || !ggml_is_contiguous(cat) || cat->ne[3] != 1) {
+        return false;
+    }
+    auto uses = [&](const ggml_tensor * t) {
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        return pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos) ? -1 : cgraph->use_counts[pos];
+    };
+    auto base_of = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+
+    const ggml_tensor * st   = cat->src[0];
+    const ggml_tensor * rows = st;
+    while (rows && (rows->op == GGML_OP_RESHAPE || rows->op == GGML_OP_VIEW)) {
+        if (rows->view_offs != 0 || uses(rows) != 1) {
+            return false;
+        }
+        rows = rows->src[0];
+    }
+    if (!rows || rows->op != GGML_OP_GET_ROWS || uses(rows) != 1 || (rows->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * cache = rows->src[0];
+    const ggml_tensor * idx   = rows->src[1];
+
+    const ggml_tensor * xt = cat->src[1];
+    if (xt->op != GGML_OP_TRANSPOSE || uses(xt) != 1) {
+        return false;
+    }
+    const ggml_tensor * x = xt->src[0];
+
+    const int64_t NS  = st->ne[0];
+    const int64_t nr  = cat->ne[1];
+    const int64_t n_t = xt->ne[0];
+    const int64_t n_s = cat->ne[2];
+    if (NS != 3 || st->ne[1] != nr || st->ne[2] != n_s || cat->ne[0] != NS + n_t || n_t < 1 || n_t > 16 ||
+        x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->ne[0] != nr || x->ne[1] != n_t || x->ne[2] != n_s ||
+        x->ne[3] != 1 || !x->buffer ||
+        cache->type != GGML_TYPE_F32 || cache->nb[0] != sizeof(float) || cache->ne[0] != NS * nr || cache->ne[2] != 1 ||
+        cache->ne[3] != 1 || cache->nb[1] % sizeof(float) != 0 || !cache->buffer ||
+        idx->type != GGML_TYPE_I32 || !ggml_is_contiguous(idx) || idx->ne[0] != n_s || !idx->buffer ||
+        rows->ne[0] != NS * nr || rows->ne[1] != n_s) {
+        return false;
+    }
+
+    // the graph optimizer interleaves these with other nodes, so they are searched in a window after the concat
+    const int j_end = std::min(cgraph->n_nodes, node_idx + 97);
+    int n_views = 0;
+    for (int j = node_idx + 1; j < j_end; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_VIEW && n->view_src == cat) {
+            ++n_views;
+            const ggml_tensor * cpy = nullptr;
+            for (int m = j + 1; m < j_end; ++m) {
+                if (cgraph->nodes[m]->op == GGML_OP_CPY && cgraph->nodes[m]->src[0] == n) {
+                    cpy = cgraph->nodes[m];
+                    break;
+                }
+            }
+            if (!cpy || uses(n) != 1 || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || f.cpys.size() >= 8) {
+                return false;
+            }
+            const ggml_tensor * d = cpy->src[1];
+            const size_t s_off = n->view_offs;
+            if (n->ne[0] != NS || n->ne[1] != nr || n->ne[2] != n_s || n->nb[0] != sizeof(float) ||
+                n->nb[1] != cat->nb[1] || n->nb[2] != cat->nb[2] || s_off % sizeof(float) != 0 ||
+                s_off / sizeof(float) > (size_t) n_t ||
+                d->type != GGML_TYPE_F32 || base_of(d) != base_of(cache) || d->ne[0] != NS * nr || d->ne[1] != n_s ||
+                d->nb[1] != cache->nb[1] || d->view_offs < cache->view_offs ||
+                (d->view_offs - cache->view_offs) % cache->nb[1] != 0) {
+                return false;
+            }
+            f.cpys.push_back(cpy);
+            f.snap_src.push_back((uint32_t) (s_off / sizeof(float)));
+            f.snap_row.push_back((uint32_t) ((d->view_offs - cache->view_offs) / cache->nb[1]));
+        } else if (n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
+            const ggml_tensor * silu = nullptr;
+            for (int m = j + 1; m < j_end; ++m) {
+                if (cgraph->nodes[m]->src[0] == n) {
+                    silu = cgraph->nodes[m];
+                    break;
+                }
+            }
+            const ggml_tensor * k = n->src[1];
+            if (f.conv || !silu || uses(n) != 1 || silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+                k->type != GGML_TYPE_F32 || k->ne[0] != NS + 1 || k->ne[1] != nr ||
+                k->nb[0] != sizeof(float) || silu->type != GGML_TYPE_F32 || silu->nb[0] != sizeof(float) ||
+                silu->ne[0] != nr || silu->ne[1] != n_t || silu->ne[2] != n_s || !silu->buffer) {
+                return false;
+            }
+            f.conv = n;
+            f.silu = silu;
+        }
+    }
+    if (!f.conv || n_views == 0 || uses(cat) != n_views + 1) {
+        return false;
+    }
+
+    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ cache, idx, x, f.conv->src[1], f.silu }) {
+        if (get_misalign_bytes(ctx, t) != 0) {
+            return false;
+        }
+    }
+
+    // a thread reads all of its channel's inputs before it writes, so the output may be x itself (same offset and
+    // strides), but not overlap it otherwise
+    if (f.silu->buffer == x->buffer) {
+        const size_t a0 = vk_tensor_offset(f.silu) + f.silu->view_offs, a1 = a0 + ggml_nbytes(f.silu);
+        const size_t b0 = vk_tensor_offset(x) + x->view_offs,           b1 = b0 + ggml_nbytes(x);
+        const bool same = a0 == b0 && f.silu->nb[1] == x->nb[1] && f.silu->nb[2] == x->nb[2];
+        if (a0 < b1 && b0 < a1 && !same) {
+            return false;
+        }
+    }
+
+    f.rows = rows;
+    f.x    = x;
+    return true;
+}
+
 static const ggml_tensor * ggml_vk_gdn_state_rows(const struct ggml_cgraph * cgraph, const ggml_tensor * gdn);
 
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
@@ -12225,9 +12388,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
     }
 
-    // the gated_delta_net that uses this state reads it from the cache
-    if (node->op == GGML_OP_GET_ROWS &&
-        std::find(ctx->gdn_skipped_rows.begin(), ctx->gdn_skipped_rows.end(), node) != ctx->gdn_skipped_rows.end()) {
+    // covered by a fused kernel elsewhere in the graph
+    if (!ctx->fused_skip.empty() && ctx->fused_skip.count(node)) {
         return false;
     }
 
@@ -12293,9 +12455,30 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             return false;
         };
 
+        // the fused conv state kernel at a concat reads the cache, index, inputs and kernel, and writes the silu
+        // output and the snapshot rows, instead of the concat's own operands
+        const vk_conv_state_fusion * csf = nullptr;
+        if (node->op == GGML_OP_CONCAT && !ctx->conv_state_fusions.empty()) {
+            auto it = ctx->conv_state_fusions.find(node);
+            if (it != ctx->conv_state_fusions.end()) {
+                csf = &it->second;
+            }
+        }
+        if (csf) {
+            for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ csf->rows->src[0], csf->rows->src[1], csf->x, csf->conv->src[1] }) {
+                need_sync = need_sync || overlaps_unsynced(t, ctx->unsynced_nodes_written);
+            }
+            need_sync = need_sync || overlaps_unsynced(csf->silu, ctx->unsynced_nodes_read) ||
+                        overlaps_unsynced(csf->silu, ctx->unsynced_nodes_written);
+            for (const ggml_tensor * c : csf->cpys) {
+                need_sync = need_sync || overlaps_unsynced(c->src[1], ctx->unsynced_nodes_read) ||
+                            overlaps_unsynced(c->src[1], ctx->unsynced_nodes_written);
+            }
+        }
+
         // For all fused ops, check if the destination node or any of the source
         // nodes require synchronization.
-        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync; ++i) {
+        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync && !csf; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // If the node actually writes to memory, then check if it needs to sync
             if (ctx->fused_ops_write_mask & (1 << i)) {
@@ -12336,8 +12519,17 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 ggml_vk_sync_buffers(ctx, compute_ctx);
             }
         }
+        if (csf) {
+            ctx->unsynced_nodes_written.push_back(csf->silu);
+            for (const ggml_tensor * c : csf->cpys) {
+                ctx->unsynced_nodes_written.push_back(c->src[1]);
+            }
+            for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ csf->rows->src[0], csf->rows->src[1], csf->x, csf->conv->src[1] }) {
+                ctx->unsynced_nodes_read.push_back(t);
+            }
+        }
         // Add all fused nodes to the unsynchronized lists.
-        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !csf; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
             if (ctx->fused_ops_write_mask & (1 << i)) {
@@ -12430,7 +12622,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
-        ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        if (auto it = ctx->conv_state_fusions.find(node); it != ctx->conv_state_fusions.end()) {
+            ggml_vk_ssm_conv_state(ctx, compute_ctx, it->second);
+        } else {
+            ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        }
 
         break;
     case GGML_OP_UPSCALE:
@@ -14524,11 +14720,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     g_vk_ab.refresh();
 
-    ctx->gdn_skipped_rows.clear();
+    ctx->fused_skip.clear();
+    ctx->conv_state_fusions.clear();
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
             if (const ggml_tensor * rows = ggml_vk_gdn_state_rows(cgraph, cgraph->nodes[i])) {
-                ctx->gdn_skipped_rows.push_back(rows);
+                ctx->fused_skip.insert(rows);
+            }
+        } else if (cgraph->nodes[i]->op == GGML_OP_CONCAT) {
+            vk_conv_state_fusion f;
+            if (ggml_vk_match_conv_state(ctx, cgraph, i, f)) {
+                ctx->fused_skip.insert(f.rows);
+                ctx->fused_skip.insert(f.conv);
+                ctx->fused_skip.insert(f.silu);
+                ctx->fused_skip.insert(f.cpys.begin(), f.cpys.end());
+                ctx->conv_state_fusions.emplace(cgraph->nodes[i], std::move(f));
             }
         }
     }

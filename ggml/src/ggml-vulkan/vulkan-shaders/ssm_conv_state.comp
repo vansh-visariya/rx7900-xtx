@@ -1,0 +1,79 @@
+#version 450
+
+// Short causal conv of a recurrent layer for small batches, with its state path fused: the previous
+// inputs come from the conv cache row of each sequence (read in place), the new ones from x, the output
+// is silu(conv), and the windows the snapshot copies take are written back into the cache slots. Replaces
+// get_rows + concat + K cpy + ssm_conv + silu. One thread per channel and sequence; it reads its state
+// before it writes any snapshot, so a read row that is also a snapshot slot is safe.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Cache  { float cache[];  };
+layout(binding = 1) readonly buffer Idx    { int   idx[];    };
+layout(binding = 2) readonly buffer X      { float x[];      };
+layout(binding = 3) readonly buffer Kern   { float kern[];   };
+layout(binding = 4) writeonly buffer Dst   { float dst[];    };
+layout(binding = 5) buffer Snap            { float snap[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint nr;        // channels
+    uint n_t;       // tokens per sequence
+    uint n_s;       // sequences
+    uint row;       // floats per cache row
+    uint xs1, xs2;  // x strides (floats) of token and sequence
+    uint ds1, ds2;  // dst strides (floats) of token and sequence
+    uint ks1;       // kernel stride (floats) of channel
+    uint n_snap;
+    uint snap_src0, snap_src1; // first input of each snapshot window, 8 bits per snapshot
+    uint snap_row[8];          // cache row of each snapshot (sequence 0)
+};
+
+const uint NC    = 4;       // conv width
+const uint NS    = NC - 1;  // state length
+const uint MAX_T = 16;      // tokens per sequence the kernel takes
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint s = gl_WorkGroupID.y;
+    if (c >= nr) {
+        return;
+    }
+
+    // all inputs of this channel in registers first (state, then up to MAX_T new ones): the output may alias x
+    float in_[NS + MAX_T];
+    const uint st_base = uint(idx[s]) * row + c * NS;
+    [[unroll]] for (uint j = 0; j < NS; ++j) {
+        in_[j] = cache[st_base + j];
+    }
+    const uint x_base = s * xs2 + c;
+    [[unroll]] for (uint t = 0; t < MAX_T; ++t) {
+        if (t < n_t) {
+            in_[NS + t] = x[x_base + t * xs1];
+        }
+    }
+
+    float w[NC];
+    [[unroll]] for (uint j = 0; j < NC; ++j) {
+        w[j] = kern[c * ks1 + j];
+    }
+
+    [[unroll]] for (uint t = 0; t < MAX_T; ++t) {
+        if (t < n_t) {
+            // the same arithmetic as ssm_conv.comp, so the results are identical
+            const float sum = dot(vec4(in_[t], in_[t + 1], in_[t + 2], in_[t + 3]), vec4(w[0], w[1], w[2], w[3]));
+            dst[s * ds2 + t * ds1 + c] = sum / (1.0f + exp(-sum));
+        }
+    }
+
+    for (uint k = 0; k < n_snap; ++k) {
+        const uint src0 = ((k < 4 ? snap_src0 : snap_src1) >> (8 * (k % 4))) & 0xFFu;
+        const uint o = (snap_row[k] + s) * row + c * NS;
+        [[unroll]] for (uint i = 0; i < NS + MAX_T; ++i) {
+            if (i >= src0 && i < src0 + NS) {
+                snap[o + i - src0] = in_[i];
+            }
+        }
+    }
+}

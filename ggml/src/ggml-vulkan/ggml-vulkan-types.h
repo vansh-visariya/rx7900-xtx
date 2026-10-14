@@ -74,6 +74,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <set>
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include <shared_mutex>
 
@@ -987,6 +988,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_state_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1232,6 +1234,18 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// conv of a recurrent layer with its state path (get_rows of the conv cache, concat with the new inputs, snapshot
+// copies of the state windows back into the cache) run as one kernel at the concat (ssm_conv_state.comp)
+struct vk_conv_state_fusion {
+    const ggml_tensor * rows = nullptr; // get_rows of the conv cache
+    const ggml_tensor * x    = nullptr; // new inputs [channels, n_t, n_s]
+    const ggml_tensor * conv = nullptr; // ssm_conv
+    const ggml_tensor * silu = nullptr; // its silu, the output
+    std::vector<const ggml_tensor *> cpys;
+    std::vector<uint32_t> snap_src;     // first input of each snapshot window
+    std::vector<uint32_t> snap_row;     // cache row of each snapshot (sequence 0)
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1264,8 +1278,11 @@ struct ggml_backend_vk_context {
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
-    // get_rows nodes not dispatched: a gated_delta_net reads their rows from the cache (ggml_vk_gdn_state_rows)
-    std::vector<const ggml_tensor *> gdn_skipped_rows;
+    // nodes a fused kernel elsewhere in the graph covers, so they are not dispatched (the gdn state get_rows,
+    // ggml_vk_gdn_state_rows; the conv state path, ggml_vk_match_conv_state), and the concats that run the fused
+    // conv state kernel
+    std::unordered_set<const ggml_tensor *> fused_skip;
+    std::unordered_map<const ggml_tensor *, vk_conv_state_fusion> conv_state_fusions;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.

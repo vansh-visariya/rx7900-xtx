@@ -704,6 +704,15 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+// ssm_conv_state.comp: conv of a recurrent layer with its cache state path fused
+struct vk_op_ssm_conv_state_push_constants {
+    uint32_t nr, n_t, n_s, row;
+    uint32_t xs1, xs2, ds1, ds2, ks1;
+    uint32_t n_snap;
+    uint32_t snap_src0, snap_src1;
+    uint32_t snap_row[8];
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;
