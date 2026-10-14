@@ -365,6 +365,28 @@ vec2 get_dm_scale(uint ib, uint iqs) {
     return FLOAT_TYPEV2(data_a_packed32[ib_k].dm) * FLOAT_TYPEV2(scale_dm);
 }
 
+#define MMVQ_UNPACK_A
+#define MMVQ_UNPACK_A_MIN
+// one 32-value sub-block (one q8_1 block): its 8 packed int8 words, and (d * scale, dmin * min), so the driver
+// unpacks it once for every column of a multi-column (speculative verify) batch
+void mmvq_unpack_a(const uint ib_a, out int32_t a_qs[8], out vec2 a_dm) {
+    const uint ib_k = ib_a / 8;
+    const uint is = ib_a % 8;
+    const uint qs_base = (is / 2) * 8;
+    const uint qs_shift = (is % 2) * 4;
+
+    [[unroll]] for (uint w = 0; w < 8; ++w) {
+#if defined(DATA_A_Q4_K)
+        a_qs[w] = int32_t((data_a_packed32[ib_k].qs[qs_base + w] >> qs_shift) & 0x0F0F0F0F);
+#else
+        a_qs[w] = int32_t(((data_a_packed32[ib_k].qs[qs_base + w] >> qs_shift) & 0x0F0F0F0F) |
+                          (((data_a_packed32[ib_k].qh[w] >> is) & 0x01010101) << 4));
+#endif
+    }
+
+    a_dm = vec2(get_dm_scale(ib_a, 0));
+}
+
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
 

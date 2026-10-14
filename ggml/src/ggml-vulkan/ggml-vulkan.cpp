@@ -6414,8 +6414,9 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     }
 
     // q6_k only has 2-byte alignment which makes it somewhat problematic,
-    // using MMVQ is only a win on Intel.
-    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL;
+    // using MMVQ for single columns is only a win on Intel. Batches gain everywhere
+    // (7900 XTX, 17408 x 5120: 2 columns 57 -> 53 us, 5 columns 104 -> 72 us)
+    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL || n > 1;
     if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6) {
         return false;
     }
