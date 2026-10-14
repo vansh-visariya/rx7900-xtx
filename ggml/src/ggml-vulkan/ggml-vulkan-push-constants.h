@@ -683,6 +683,9 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
     // external snapshot target (ggml_gated_delta_net_snap): n_snap == 0 writes snapshots to dst
     uint32_t n_snap, snap_seq_stride, snap_slot_stride;
+    // state_row != 0: the state binding is the recurrent cache, a sequence's state starts at row idx[seq] (rows of
+    // state_row floats) instead of being a gathered [D, n_seqs] copy
+    uint32_t state_row;
 };
 
 struct vk_op_ssm_scan_push_constants {

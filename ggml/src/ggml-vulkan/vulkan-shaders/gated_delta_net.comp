@@ -33,6 +33,7 @@ layout(push_constant) uniform Parameters {
     float scale;
     uint K;
     uint n_snap, snap_seq_stride, snap_slot_stride;
+    uint state_row;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -44,6 +45,8 @@ layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 // external snapshot target when n_snap > 0 (bound to dst otherwise)
 layout(binding = 7)           buffer SnapBuf  { FLOAT_TYPE data_snap[];  };
+// cache row of each sequence's state when state_row != 0
+layout(binding = 8) readonly  buffer IdxBuf   { int data_idx[]; };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -106,7 +109,9 @@ void main() {
 
     const uint state_size = S_V * S_V;
     // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
-    const uint state_in_base       = (seq_id * H + head_id) * state_size;
+    // or, read in place from the recurrent cache: each lane loads its elements before writing them as snapshots
+    const uint state_in_base       = state_row != 0u ? uint(data_idx[seq_id]) * state_row + head_id * state_size
+                                                     : (seq_id * H + head_id) * state_size;
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;

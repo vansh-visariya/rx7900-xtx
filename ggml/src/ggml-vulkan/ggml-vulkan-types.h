@@ -1264,6 +1264,8 @@ struct ggml_backend_vk_context {
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
+    // get_rows nodes not dispatched: a gated_delta_net reads their rows from the cache (ggml_vk_gdn_state_rows)
+    std::vector<const ggml_tensor *> gdn_skipped_rows;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
