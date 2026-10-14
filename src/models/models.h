@@ -2357,12 +2357,6 @@ struct llama_model_qwen35 : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
-        ggml_tensor * build_norm_gated(
-                    ggml_tensor * input,
-                    ggml_tensor * weights,
-                    ggml_tensor * gate,
-                            int   layer);
-
         // returns pair of qkv, z
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,
