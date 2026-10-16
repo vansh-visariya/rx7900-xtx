@@ -7311,6 +7311,52 @@ struct test_mul_mat_add_residual : public test_case {
     }
 };
 
+// mat-vec followed by nodes a backend can run in its epilogue: the qwen35 gated delta net gate
+// softplus(x + dt) * A (mode 0), its beta sigmoid (mode 1), and the output gate silu(z) (mode 2)
+struct test_mul_mat_vec_epilogue : public test_case {
+    const ggml_type type;
+    const int mode;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    test_mul_mat_vec_epilogue(ggml_type type, int mode, int64_t m, int64_t n, int64_t k)
+        : type(type), mode(mode), m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, mode, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_EPILOGUE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // as test_mul_mat: the backends' quantized / bf16 dot products differ from the CPU's
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * out = ggml_mul_mat(ctx, w, x);
+        if (mode == 0) {
+            ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            ggml_tensor * a  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            out = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, out, dt)), a);
+        } else if (mode == 1) {
+            out = ggml_sigmoid(ctx, out);
+        } else {
+            out = ggml_silu(ctx, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -11365,6 +11411,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S}) {
         for (int64_t n : {1, 2, 5, 8, 9}) {
             test_cases.emplace_back(new test_mul_mat_add_residual(type, 256, n, 512));
+        }
+    }
+
+    // mat-vec epilogues (gated delta net gate prep); 9 columns runs unfused
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        for (int mode : {0, 1, 2}) {
+            for (int64_t n : {1, 2, 5, 8, 9}) {
+                test_cases.emplace_back(new test_mul_mat_vec_epilogue(type, mode, 48, n, 256));
+            }
+            test_cases.emplace_back(new test_mul_mat_vec_epilogue(type, mode, 1024, 5, 512));
         }
     }
 

@@ -4,6 +4,13 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// mat-vec epilogue (ggml_vk_match_mmv_epilogue): bias0 holds one value per row for every column, then an
+// activation, then a multiply by fuse1, one value per row
+#define MAT_VEC_FUSION_FLAGS_BIAS0_ROW    0x10
+#define MAT_VEC_FUSION_FLAGS_SCALE1_ROW   0x20
+#define MAT_VEC_FUSION_FLAGS_ACT_SOFTPLUS 0x40
+#define MAT_VEC_FUSION_FLAGS_ACT_SIGMOID  0x80
+#define MAT_VEC_FUSION_FLAGS_ACT_SILU     0x100
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)

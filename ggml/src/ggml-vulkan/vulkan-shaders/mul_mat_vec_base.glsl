@@ -90,6 +90,34 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
+#ifndef MUL_MAT_ID
+// the nodes fused after the mat-vec (ggml_vk_match_mmv_epilogue): a per-row bias, an activation, a per-row scale.
+// The activations are unary.comp's expressions and the order is the separate nodes' (add, op, mul), so the result
+// equals theirs bit for bit. Only in the pipeline variant with MMV_EPILOGUE != 0, which stores one output per
+// invocation: extra code in the plain store path slows every mat-vec, even when it is skipped.
+layout (constant_id = 3) const uint MMV_EPILOGUE = 0;
+
+FLOAT_TYPE mmv_epilogue(FLOAT_TYPE v, const uint row) {
+    const uint flags = p.fusion_flags;
+    if ((flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+        v += FLOAT_TYPE(data_fuse0[row]);
+    }
+    float y = float(v);
+    const uint act = flags & (MAT_VEC_FUSION_FLAGS_ACT_SOFTPLUS | MAT_VEC_FUSION_FLAGS_ACT_SIGMOID | MAT_VEC_FUSION_FLAGS_ACT_SILU);
+    if (act == MAT_VEC_FUSION_FLAGS_ACT_SOFTPLUS) {
+        y = (y > 20.0f) ? y : log(1.0f + exp(y));
+    } else if (act == MAT_VEC_FUSION_FLAGS_ACT_SIGMOID) {
+        y = 1.0f / (1.0f + exp(-y));
+    } else if (act == MAT_VEC_FUSION_FLAGS_ACT_SILU) {
+        y = y / (1.0f + exp(-y));
+    }
+    if ((flags & MAT_VEC_FUSION_FLAGS_SCALE1_ROW) != 0) {
+        y *= float(data_fuse1[row]);
+    }
+    return FLOAT_TYPE(y);
+}
+#endif
+
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -98,6 +126,26 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
         }
     }
 
+#ifndef MUL_MAT_ID
+    if (MMV_EPILOGUE != 0) {
+        for (uint o = tid; o < NUM_COLS * NUM_ROWS; o += BLOCK_SIZE) {
+            const uint jo = o / NUM_ROWS;
+            const uint no = o % NUM_ROWS;
+            if (no < num_rows) {
+                FLOAT_TYPE v = FLOAT_TYPE(0);
+                [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                        if (j == jo && n == no) {
+                            v = temp[j][n];
+                        }
+                    }
+                }
+                data_d[jo*p.batch_stride_d + d_offset + first_row + no] = D_TYPE(mmv_epilogue(v, first_row + no));
+            }
+        }
+        return;
+    }
+#endif
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -149,6 +197,23 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
         }
     }
     barrier();
+#ifndef MUL_MAT_ID
+    if (MMV_EPILOGUE != 0) {
+        for (uint o = tid; o < NUM_COLS * NUM_ROWS; o += BLOCK_SIZE) {
+            const uint jo = o / NUM_ROWS;
+            const uint no = o % NUM_ROWS;
+            if (no < num_rows) {
+                // the order of tid 0's sum below
+                FLOAT_TYPE v = FLOAT_TYPE(0);
+                [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
+                    v += tmpsh[jo][no][s];
+                }
+                data_d[jo*p.batch_stride_d + d_offset + first_row + no] = D_TYPE(mmv_epilogue(v, first_row + no));
+            }
+        }
+        return;
+    }
+#endif
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -198,6 +263,18 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
         }
         barrier();
     }
+#ifndef MUL_MAT_ID
+    if (MMV_EPILOGUE != 0) {
+        for (uint o = tid; o < NUM_COLS * NUM_ROWS; o += BLOCK_SIZE) {
+            const uint jo = o / NUM_ROWS;
+            const uint no = o % NUM_ROWS;
+            if (no < num_rows) {
+                data_d[jo*p.batch_stride_d + d_offset + first_row + no] = D_TYPE(mmv_epilogue(tmpsh[jo][no][0], first_row + no));
+            }
+        }
+        return;
+    }
+#endif
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {

@@ -268,6 +268,8 @@ struct vk_pipeline_struct {
     // linked list of pipelines for multiple compilation variants.
     // currently only used to compile a 64-bit indexing variant.
     vk_pipeline next;
+    // mat-vecs: the same shader with the epilogue compiled in (MMV_EPILOGUE spec constant, ggml_vk_match_mmv_epilogue)
+    vk_pipeline epi;
 };
 
 typedef std::weak_ptr<vk_pipeline_struct> vk_pipeline_ref;
@@ -1121,6 +1123,20 @@ typedef std::vector<vk_submission> vk_sequence;
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
 
+// mat-vec epilogue (ggml_vk_match_mmv_epilogue): bias0 holds one value per row for every column, then an
+// activation, then a multiply by fuse1, one value per row
+#define MAT_VEC_FUSION_FLAGS_BIAS0_ROW    0x10
+#define MAT_VEC_FUSION_FLAGS_SCALE1_ROW   0x20
+#define MAT_VEC_FUSION_FLAGS_ACT_SOFTPLUS 0x40
+#define MAT_VEC_FUSION_FLAGS_ACT_SIGMOID  0x80
+#define MAT_VEC_FUSION_FLAGS_ACT_SILU     0x100
+
+struct vk_mmv_epilogue {
+    uint32_t flags = 0;                // MAT_VEC_FUSION_FLAGS_*, 0 when the fused nodes are ADDs (the bias path)
+    const ggml_tensor * fuse0 = nullptr;
+    const ggml_tensor * fuse1 = nullptr;
+};
+
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
 
@@ -1354,6 +1370,8 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    // the nodes after the current mat-vec that run in its epilogue
+    vk_mmv_epilogue mmv_epi;
 
     // for GGML_VK_GPU_SPAN: GPU timestamps at the start and the end of each graph
     vk::QueryPool span_pool;
