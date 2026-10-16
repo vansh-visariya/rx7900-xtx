@@ -84,6 +84,8 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 // LLAMA_DECODE_TIMING=1: per-context host-side decode phase timings (diagnostic only)
 struct llama_decode_timing {
     bool enabled = getenv("LLAMA_DECODE_TIMING") != nullptr;
+    // LLAMA_DECODE_TIMING=N prints every N decodes of a context (1 means 256)
+    int64_t every = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); const long long v = e ? atoll(e) : 0; return v > 1 ? (int64_t) v : (int64_t) 256; }();
     struct acc {
         int64_t n = 0, n_reused = 0, n_tokens = 0;
         double t_total = 0, t_build = 0, t_inputs = 0, t_compute = 0, t_sync = 0, n_sync = 0;
@@ -93,8 +95,9 @@ struct llama_decode_timing {
 
     void print_maybe(const void * ctx) {
         auto & a = accs[ctx];
-        if (a.n > 0 && a.n % 256 == 0) {
-            LLAMA_LOG_INFO("decode_timing ctx %p: decodes %lld (reused %.0f%%), n_tokens %.1f, total %.3f ms = mem_update %.3f + init_batch %.3f + apply %.3f + build/alloc %.3f + inputs %.3f + compute %.3f + rest; sync %.3f ms x %.2f\n",
+        if (a.n > 0 && a.n % every == 0) {
+            // stderr: servers filter info logs
+            fprintf(stderr, "decode_timing ctx %p: decodes %lld (reused %.0f%%), n_tokens %.1f, total %.3f ms = mem_update %.3f + init_batch %.3f + apply %.3f + build/alloc %.3f + inputs %.3f + compute %.3f + rest; sync %.3f ms x %.2f\n",
                     ctx, (long long) a.n, 100.0 * a.n_reused / a.n, (double) a.n_tokens / a.n,
                     a.t_total / a.n, a.t_memupd / a.n, a.t_init / a.n, a.t_apply / a.n, a.t_build / a.n, a.t_inputs / a.n, a.t_compute / a.n,
                     a.n_sync > 0 ? a.t_sync / a.n_sync : 0.0, a.n_sync / a.n);
