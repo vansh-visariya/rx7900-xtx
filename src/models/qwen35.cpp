@@ -353,35 +353,33 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * beta  = build_lora_mm(model.layers[il].ssm_beta,  cur, model.layers[il].ssm_beta_s);
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    ggml_build_forward_expand(gf, qkv_mixed);
-    ggml_build_forward_expand(gf, z);
-    ggml_build_forward_expand(gf, beta);
-    ggml_build_forward_expand(gf, alpha);
 
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
-    cb(beta, "beta", il);
+    cb(beta,  "beta",  il);
+    cb(alpha, "alpha", il);
 
+    // the gate prep on the 2D projection outputs, each node right after its projection so a backend can run it in
+    // the projection's epilogue (Vulkan: mat-vec + activation, mat-vec + bias + softplus + scale):
+    // sigmoid(beta), softplus(alpha + dt) * A (-A_log.exp() * softplus), and silu(z) of the gated output norm
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
-
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
-    cb(alpha, "alpha", il);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);
     cb(gate, "gate", il);
 
-    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
-
-    // silu(z) of the gated output norm; like the gate and beta it only needs the projections, so these run in the
-    // batch after them instead of next to the dependent ops they feed
     ggml_tensor * z_silu = ggml_silu(ctx0, z);
-    ggml_build_forward_expand(gf, beta);
+
+    // the small alpha/beta projections first: issued after the large ones they start late and end the batch
     ggml_build_forward_expand(gf, gate);
+    ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, qkv_mixed);
     ggml_build_forward_expand(gf, z_silu);
+
+    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
