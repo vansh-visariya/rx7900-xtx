@@ -336,6 +336,9 @@ struct vk_command_pool {
 
     vk_queue *q;
 
+    // command buffers are recorded without one-time-submit, so they can be submitted again (vk_graph_replay)
+    bool reusable = false;
+
     size_t buffers_in_use() const {
         return std::count_if(cmd_buffers.begin(), cmd_buffers.end(),
             [](const auto& cb) { return cb.in_use; });
@@ -1021,6 +1024,10 @@ struct vk_device_struct {
     vk::Fence fence;
     vk_buffer sync_staging;
 
+    // bumped whenever a buffer of this device is destroyed: recorded command buffers that bind buffers by handle
+    // are stale after that (vk_graph_replay)
+    std::atomic<uint64_t> buffer_epoch {0};
+
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
@@ -1066,6 +1073,7 @@ struct vk_buffer_struct {
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
+        device->buffer_epoch.fetch_add(1, std::memory_order_relaxed);
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
     }
@@ -1246,6 +1254,30 @@ struct vk_conv_state_fusion {
     std::vector<uint32_t> snap_row;     // cache row of each snapshot (sequence 0)
 };
 
+// a recorded graph that graph_compute submits again, unchanged, while it gets graphs whose nodes match (GGML_VK_GRAPH_REPLAY)
+struct vk_graph_replay {
+    // key (ggml_vk_replay_key): what the recording read, the switches, the nodes, the fields of the nodes and of the
+    // tensors they read, and the use counts of the graph
+    uint64_t cfg[3] = {};
+    std::vector<const ggml_tensor *> nodes;
+    std::vector<const ggml_tensor *> ext;  // sources and view sources that are not nodes of the graph, each once
+    std::vector<uint8_t> fields;           // the fields before the name, of each node, then of each of ext
+    std::vector<std::pair<const ggml_tensor *, int32_t>> uses; // used slots of the graph's hash set, in slot order
+    uint64_t epoch = 0;                    // device buffer_epoch at recording
+    vk_command_pool pool;                  // reusable, its own: the context pool is reset after every graph
+    std::vector<vk::CommandBuffer> cmd_bufs; // in submission order
+    // its own descriptor sets: the context's sets are rewritten by every recorded graph
+    std::vector<vk::DescriptorPool> descriptor_pools;
+    std::vector<vk::DescriptorSet> descriptor_sets;
+    // while recording, the context's descriptor set index and requirement are parked here
+    uint32_t set_idx = 0;
+    uint32_t set_req = 0;
+    uint64_t last_use = 0;
+    bool valid = false;
+    bool in_flight = false;                // submitted, not waited for yet
+    bool ok = false;                       // set while recording: nothing seen that a resubmission would not repeat
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1303,6 +1335,12 @@ struct ggml_backend_vk_context {
 
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
+
+    // GGML_VK_GRAPH_REPLAY: recorded graphs, least recently used replaced first; while one is being recorded,
+    // compute contexts take their command buffers from its pool
+    std::vector<std::unique_ptr<vk_graph_replay>> replays;
+    vk_graph_replay * replay_rec {};
+    uint64_t replay_clock {};
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
