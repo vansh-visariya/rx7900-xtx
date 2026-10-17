@@ -64,15 +64,13 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
-// LLAMA_KQ_MASK_GPU=1 (off by default): the causal mask is built on the device from cell and token positions instead of
-// uploading the host mask (n_kv x n_tokens f16, 128 MB for a 512-token batch at 128K). Off by default: on Qwen3.8-27B the
-// mask moves ggml-alloc placements so that the Vulkan conv-state fusion is skipped for multi-token batches, which costs
-// more than the mask saves at short context. The host mask stays for ALiBi, SWA, non-causal attention, several sequences
-// per ubatch, embedding batches (an image puts several tokens at one M-RoPE position) and batches spanning 2048 positions
-// or more (f16 holds the relative positions exactly below that)
+// the causal mask is built on the device from cell and token positions instead of uploading the host mask (n_kv x
+// n_tokens f16, 128 MB for a 512-token batch at 128K); LLAMA_KQ_MASK_GPU=0 keeps the host mask. The host mask stays for
+// ALiBi, SWA, non-causal attention, several sequences per ubatch, embedding batches (an image puts several tokens at one
+// M-RoPE position) and batches spanning 2048 positions or more (f16 holds the relative positions exactly below that)
 static bool kq_mask_on_device(const llama_hparams & hparams, const llama_cparams & cparams, const llama_ubatch & ubatch) {
     const char * env = getenv("LLAMA_KQ_MASK_GPU");
-    if (!env || atoi(env) == 0 || !cparams.flash_attn || !cparams.causal_attn || hparams.use_alibi ||
+    if ((env && atoi(env) == 0) || !cparams.flash_attn || !cparams.causal_attn || hparams.use_alibi ||
         hparams.swa_type != LLAMA_SWA_TYPE_NONE || ubatch.n_seqs_unq != 1 || ubatch.token == nullptr || !ubatch.pos) {
         return false;
     }
