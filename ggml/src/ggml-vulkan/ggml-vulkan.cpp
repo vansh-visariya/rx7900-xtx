@@ -1134,8 +1134,9 @@ vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buff
 //   GGML_VK_FUSE_Q8_1=0     producers do not write the q8_1 copy for the next integer mat-vec
 //   GGML_VK_FUSE_MMV_ADD=0  no residual ADD fusion into mat-vecs of 2-8 columns
 //   GGML_VK_FUSE_GDN_STATE=0  gated_delta_net reads a gathered copy of its state instead of the cache row
-//   GGML_VK_FUSE_CONV_STATE=0 the conv state path of recurrent layers runs as separate nodes; 2 test: the fused
-//                           kernel always reads a copy of its new inputs (the path for an output that overlaps them)
+//   GGML_VK_FUSE_CONV_STATE=0 the conv state path of recurrent layers runs as separate nodes; tests of the paths for
+//                           an output that overlaps the new inputs: 2 the fused kernel always reads a copy of them,
+//                           3 it always runs the 2-channel orbit mapping with a barrier (ssm_conv_state.comp)
 //   GGML_VK_FUSE_MMV_EPI=0  no bias/activation/scale epilogues on mat-vecs (ggml_vk_match_mmv_epilogue)
 //   GGML_VK_SKIP_OPS=OP[:src0type],...  diagnostic: skip matching nodes (and their fused followers) to measure their
 //                           in-graph cost, results are wrong while set. QUANTIZE_Q8_1 skips the mat-vec input quantize
@@ -1149,7 +1150,7 @@ struct ggml_vk_ab_env {
     bool                     fuse_mmv_add  = true;
     bool                     fuse_gdn_state = true;
     bool                     fuse_conv_state = true;
-    bool                     conv_state_stage = false;
+    int                      conv_state_test = 0;
     bool                     fuse_mmv_epi  = true;
     bool                     submit_at_end = false;
     int                      graph_replay  = 0;
@@ -1159,7 +1160,7 @@ struct ggml_vk_ab_env {
     uint64_t cfg_word() const {
         return (uint64_t) fuse_q8_1 | (uint64_t) fuse_mmv_add << 1 | (uint64_t) fuse_gdn_state << 2 |
                (uint64_t) fuse_conv_state << 3 | (uint64_t) submit_at_end << 4 | (uint64_t) fuse_mmv_epi << 5 |
-               (uint64_t) conv_state_stage << 6;
+               (uint64_t) conv_state_test << 6;
     }
 
     void refresh() {
@@ -1189,7 +1190,7 @@ struct ggml_vk_ab_env {
         fuse_gdn_state = !gs || atoi(gs) != 0;
         const char * cs = getenv("GGML_VK_FUSE_CONV_STATE");
         fuse_conv_state = !cs || atoi(cs) != 0;
-        conv_state_stage = cs && atoi(cs) == 2;
+        conv_state_test = cs && (atoi(cs) == 2 || atoi(cs) == 3) ? atoi(cs) : 0;
         const char * me = getenv("GGML_VK_FUSE_MMV_EPI");
         fuse_mmv_epi = !me || atoi(me) != 0;
         const char * se = getenv("GGML_VK_SUBMIT_AT_END");
@@ -10395,6 +10396,8 @@ static void ggml_vk_ssm_conv_state(ggml_backend_vk_context * ctx, vk_context& su
     pc.ds2  = (uint32_t)(dst->nb[2] / sizeof(float));
     pc.ks1  = (uint32_t)(kern->nb[1] / sizeof(float));
     pc.n_snap = (uint32_t)f.cpys.size();
+    pc.orbit  = f.orbit;
+    pc.sync   = f.sync;
     for (size_t k = 0; k < f.cpys.size(); ++k) {
         (k < 4 ? pc.snap_src0 : pc.snap_src1) |= f.snap_src[k] << (8 * (k % 4));
         pc.snap_row[k] = f.snap_row[k];
@@ -12582,27 +12585,47 @@ static bool ggml_vk_match_conv_state(const ggml_backend_vk_context * ctx, const 
         }
     }
 
-    // one thread per channel reads all of its inputs before it writes its outputs. So the output may overlap x if each
-    // output that lands on x lands on an input of its own thread that it is computed from: equal token strides and an
-    // output that starts 0 to NS token rows before x (output t on input t - m, m <= NS, one of its own conv inputs).
-    // (Qwen3.8-27B with LLAMA_KQ_MASK_GPU=1: 2 or 3 rows before x in every layer.) Any other overlap would let a thread
-    // overwrite inputs that another workgroup has not read yet: the kernel then reads a copy of x (stage_x)
-    f.stage_x = g_vk_ab.conv_state_stage;
+    // ggml-alloc can give the freed x to the conv output (Qwen3.8-27B with the device KQ mask: 2, 2.5 or 3 token rows
+    // before x). Output element i then lands on input element i - k: with contiguous rows of nr floats, output channel
+    // c lands on input channel c - k (mod nr) of another token, so the channels form orbits of L = nr / gcd(k mod nr,
+    // nr). If L divides the workgroup (64), each workgroup takes whole orbits, reads all of their inputs and writes
+    // after a barrier (orbit, sync). Any other overlap reads a copy of x (stage_x)
+    if (g_vk_ab.conv_state_test == 2) {
+        f.stage_x = true;
+    } else if (g_vk_ab.conv_state_test == 3 && nr % 128 == 0) {
+        f.orbit = 2;
+        f.sync  = true;
+    }
     if (f.silu->buffer == x->buffer) {
         const size_t a0 = vk_tensor_offset(f.silu) + f.silu->view_offs, a1 = a0 + ggml_nbytes(f.silu);
         const size_t b0 = vk_tensor_offset(x) + x->view_offs,           b1 = b0 + ggml_nbytes(x);
-        const size_t row = x->nb[1];
-        const bool own = f.silu->nb[1] == row && row >= nr * sizeof(float) && a0 <= b0 && (b0 - a0) % row == 0 &&
-                         (b0 - a0) / row <= (size_t) NS;
-        if (a0 < b1 && b0 < a1 && !own) {
-            if (ggml_vk_fuse_alias_log()) {
-                fprintf(stderr, "ggml_vulkan: conv state at node %d stages x: silu output [%zu, %zu) partly overlaps x [%zu, %zu)\n",
-                        node_idx, a0, a1, b0, b1);
+        if (a0 < b1 && b0 < a1) {
+            const int64_t d = (int64_t) b0 - (int64_t) a0;
+            int64_t L = 0;
+            if (f.silu->nb[1] == (size_t) nr * sizeof(float) && x->nb[1] == (size_t) nr * sizeof(float) &&
+                d % (int64_t) sizeof(float) == 0) {
+                int64_t g = nr, r = ((d / (int64_t) sizeof(float)) % nr + nr) % nr;
+                while (r != 0) {
+                    const int64_t t = g % r;
+                    g = r;
+                    r = t;
+                }
+                L = nr / g;
             }
-            f.stage_x = true;
-        } else if (a0 < b1 && b0 < a1 && ggml_vk_fuse_alias_log()) {
-            fprintf(stderr, "ggml_vulkan: conv state at node %d: silu output starts %zu rows before x (in place)\n",
-                    node_idx, (b0 - a0) / row);
+            if (L > 0 && 64 % L == 0 && (L == 1 || nr % 64 == 0)) {
+                f.orbit = (uint32_t) L;
+                f.sync  = true;
+                if (ggml_vk_fuse_alias_log()) {
+                    fprintf(stderr, "ggml_vulkan: conv state at node %d in place: silu output starts %.2f rows before x, orbits of %d\n",
+                            node_idx, (double) d / x->nb[1], (int) L);
+                }
+            } else {
+                f.stage_x = true;
+                if (ggml_vk_fuse_alias_log()) {
+                    fprintf(stderr, "ggml_vulkan: conv state at node %d stages x: silu output [%zu, %zu) partly overlaps x [%zu, %zu)\n",
+                            node_idx, a0, a1, b0, b1);
+                }
+            }
         }
     }
 

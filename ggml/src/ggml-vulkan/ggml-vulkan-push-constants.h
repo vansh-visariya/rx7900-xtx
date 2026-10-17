@@ -720,6 +720,7 @@ struct vk_op_ssm_conv_state_push_constants {
     uint32_t n_snap;
     uint32_t snap_src0, snap_src1;
     uint32_t snap_row[8];
+    uint32_t orbit, sync;
 };
 
 struct vk_op_conv2d_push_constants {

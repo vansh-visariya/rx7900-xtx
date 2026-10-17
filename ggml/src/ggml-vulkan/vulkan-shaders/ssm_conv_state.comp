@@ -5,6 +5,10 @@
 // is silu(conv), and the windows the snapshot copies take are written back into the cache slots. Replaces
 // get_rows + concat + K cpy + ssm_conv + silu. One thread per channel and sequence; it reads its state
 // before it writes any snapshot, so a read row that is also a snapshot slot is safe.
+// The output may overlap x (ggml-alloc can give it the freed x): output channel c then lands on input channel
+// c - r (mod nr) of another token, r a multiple of nr / orbit. A workgroup takes 64 / orbit whole orbits
+// {o + j nr / orbit}, reads all of their inputs and writes only after a barrier (sync), so every input an output
+// overwrites has been read.
 
 #extension GL_EXT_control_flow_attributes : require
 
@@ -28,6 +32,8 @@ layout(push_constant) uniform PushConstants {
     uint n_snap;
     uint snap_src0, snap_src1; // first input of each snapshot window, 8 bits per snapshot
     uint snap_row[8];          // cache row of each snapshot (sequence 0)
+    uint orbit;                // channels per orbit (1: the plain mapping), see above
+    uint sync;                 // barrier between the reads and the writes
 };
 
 const uint NC    = 4;       // conv width
@@ -35,28 +41,36 @@ const uint NS    = NC - 1;  // state length
 const uint MAX_T = 16;      // tokens per sequence the kernel takes
 
 void main() {
-    const uint c = gl_GlobalInvocationID.x;
-    const uint s = gl_WorkGroupID.y;
-    if (c >= nr) {
-        return;
-    }
+    const uint per = 64 / orbit;
+    const uint li  = gl_LocalInvocationID.x;
+    const uint c   = gl_WorkGroupID.x * per + li % per + (li / per) * (nr / orbit);
+    const uint s   = gl_WorkGroupID.y;
+    const bool live = c < nr;
 
-    // all inputs of this channel in registers first (state, then up to MAX_T new ones): the output may alias x
+    // all inputs of this channel in registers first (state, then up to MAX_T new ones): the output may overlap x
     float in_[NS + MAX_T];
-    const uint st_base = uint(idx[s]) * row + c * NS;
-    [[unroll]] for (uint j = 0; j < NS; ++j) {
-        in_[j] = cache[st_base + j];
-    }
-    const uint x_base = s * xs2 + c;
-    [[unroll]] for (uint t = 0; t < MAX_T; ++t) {
-        if (t < n_t) {
-            in_[NS + t] = x[x_base + t * xs1];
+    float w[NC];
+    if (live) {
+        const uint st_base = uint(idx[s]) * row + c * NS;
+        [[unroll]] for (uint j = 0; j < NS; ++j) {
+            in_[j] = cache[st_base + j];
+        }
+        const uint x_base = s * xs2 + c;
+        [[unroll]] for (uint t = 0; t < MAX_T; ++t) {
+            if (t < n_t) {
+                in_[NS + t] = x[x_base + t * xs1];
+            }
+        }
+        [[unroll]] for (uint j = 0; j < NC; ++j) {
+            w[j] = kern[c * ks1 + j];
         }
     }
-
-    float w[NC];
-    [[unroll]] for (uint j = 0; j < NC; ++j) {
-        w[j] = kern[c * ks1 + j];
+    if (sync != 0) {
+        memoryBarrierBuffer();
+        barrier();
+    }
+    if (!live) {
+        return;
     }
 
     [[unroll]] for (uint t = 0; t < MAX_T; ++t) {

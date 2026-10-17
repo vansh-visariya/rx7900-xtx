@@ -1279,6 +1279,8 @@ struct vk_conv_state_fusion {
     std::vector<uint32_t> snap_src;     // first input of each snapshot window
     std::vector<uint32_t> snap_row;     // cache row of each snapshot (sequence 0)
     bool stage_x = false;               // the kernel reads a copy of x in prealloc_x (the output overlaps x)
+    uint32_t orbit = 1;                 // the output overlaps x in place: channels per orbit, see ssm_conv_state.comp
+    bool sync = false;                  // barrier between the kernel's reads and writes
 };
 
 // a recorded graph that graph_compute submits again, unchanged, while it gets graphs whose nodes match (GGML_VK_GRAPH_REPLAY)
