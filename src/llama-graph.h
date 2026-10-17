@@ -279,6 +279,17 @@ public:
     // build_conv_state so the K per-layer conv-state snapshot copies become one SET_ROWS
     ggml_tensor * rs_rev_idx = nullptr; // I32 [K]
 
+    // delta-net update logs (llama_memory_recurrent::n_embd_log > 0): I32 [n_rs, 4], per cell the state row, the log
+    // read row, the log write row and the log entries to replay; with views of the processed and the copied cells
+    ggml_tensor * s_log = nullptr;
+    ggml_tensor * s_log_state_main  = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_log_state_extra = nullptr; // I32 [n_rs - n_seqs]
+    ggml_tensor * s_log_r_main      = nullptr;
+    ggml_tensor * s_log_r_extra     = nullptr;
+    ggml_tensor * s_log_w_main      = nullptr;
+    ggml_tensor * s_log_w_extra     = nullptr;
+    ggml_tensor * s_log_n           = nullptr; // I32 [n_seqs]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

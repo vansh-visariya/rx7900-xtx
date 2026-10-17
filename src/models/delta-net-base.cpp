@@ -556,6 +556,21 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+ggml_tensor * llm_build_delta_net_base::build_recurrent_state(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        ssm_states_all,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    // with an update log the cache holds one state per cell
+    if (inp->s_log && mctx_cur->get_l_l(il)) {
+        return build_rs(ssm_states_all, inp->s_log_state_main, inp->s_log_state_extra, hparams.n_embd_s(), ubatch.n_seqs,
+                mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
+    }
+
+    return build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs);
+}
+
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,
@@ -595,6 +610,49 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+    // rollback by replay: one state and the update log of the last min(n_seq_tokens, n_rs_seq) tokens per cell
+    ggml_tensor * log_all = mctx_cur->get_l_l(il);
+    if (inp->s_log && log_all) {
+        const int64_t R  = cparams.n_rs_seq;
+        const int64_t ER = log_all->ne[0];
+
+        ggml_tensor * log = ggml_get_rows(ctx0, log_all, inp->s_log_r_main);
+        log = ggml_reshape_3d(ctx0, log, ER / R, R, n_seqs);
+        cb(log, "gdn_log_in", il);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, log, inp->s_log_n);
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+        const int64_t n_attn = S_v * H_v * n_seq_tokens * n_seqs;
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        ggml_tensor * state_new = ggml_view_2d(ctx0, gdn_out, D, n_seqs,
+            ggml_row_size(gdn_out->type, D), ggml_row_size(gdn_out->type, n_attn));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, state_new,
+            ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1], (size_t) kv_head * row_size)));
+
+        ggml_tensor * log_new = ggml_view_2d(ctx0, gdn_out, ER, n_seqs,
+            ggml_row_size(gdn_out->type, ER), ggml_row_size(gdn_out->type, n_attn + D * n_seqs));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, log_all, log_new, inp->s_log_w_main));
+
+        // cells that only copy their state copy its log too
+        if (inp->s_log_r_extra->ne[0] > 0) {
+            ggml_tensor * log_extra = ggml_get_rows(ctx0, log_all, inp->s_log_r_extra);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, log_all, log_extra, inp->s_log_w_extra));
+        }
+
+        return output;
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
@@ -613,8 +671,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
         0);
     cb(output, "attn_output", il);
-
-    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);

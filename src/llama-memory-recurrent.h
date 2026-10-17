@@ -78,6 +78,11 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // rollback by replay for delta-net states (0 = snapshot groups): the state tensors hold one state per cell, and
+    // each cell has a log of the state updates of its last batch in two blocks (one read, the other written)
+    uint32_t n_embd_log = 0; // floats per log entry: k [s_k*h_k] | delta [s_v*h_v] | exp(g) [h_v]
+    uint32_t gdn_s_k = 0, gdn_h_k = 0, gdn_s_v = 0, gdn_h_v = 0;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -92,6 +97,13 @@ public:
         int32_t   tail = -1;
 
         std::set<llama_seq_id> seq_id;
+
+        // update log of the state in this row (n_embd_log > 0): block in use and its entries,
+        // and as staged for the inputs of the current ubatch (of the source row, like src0)
+        uint32_t log_p  = 0;
+        uint32_t log_n  = 0;
+        uint32_t log_p0 = 0;
+        uint32_t log_n0 = 0;
 
         bool has_seq_id(const llama_seq_id & id) const {
             return seq_id.find(id) != seq_id.end();
@@ -113,6 +125,8 @@ public:
     std::vector<ggml_tensor *> s_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
+    // update logs [n_embd_log * n_rs_seq, 2 * size], row = block * size + cell
+    std::vector<ggml_tensor *> l_l;
 
 private:
     //const llama_model & model;
@@ -129,8 +143,19 @@ private:
     size_t size_s_bytes() const;
     size_t size_p_bytes() const;
 
+    // a logged state as written: its row, log block and number of entries to apply
+    struct log_cell {
+        uint32_t row;
+        uint32_t p;
+        uint32_t n;
+    };
+
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                          const std::vector<log_cell> & log_cells) const;
+
+    // the state of a logged cell with its log applied
+    void state_get_logged(uint32_t il, const log_cell & lc, std::vector<float> & state) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -174,8 +199,14 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+    ggml_tensor * get_l_l(int32_t il) const;
 
-    int32_t s_copy(int i) const;
+    uint32_t get_n_embd_log() const;
+
+    // source row of cell head + i, with the rollback applied; consumes the pending rollback.
+    // with a log (log != null): also the state row, log read row, log write row and the entries to replay,
+    // for cells processed in the ubatch (i < n_seqs) or only copied
+    int32_t s_copy(int i, int32_t * log = nullptr, uint32_t n_seqs = 0) const;
 
 private:
     const llama_memory_status status;
