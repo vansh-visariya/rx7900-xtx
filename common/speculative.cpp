@@ -1100,6 +1100,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // a request's draft-q draws start from the same state, so its text does not depend on earlier requests
+        if (seq_id < (llama_seq_id) rngs.size()) {
+            rngs[seq_id].seed(0xdf1a5u + seq_id);
+        }
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1607,6 +1612,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // a request's draft-q draws start from the same state, so its text does not depend on earlier requests
+        if (seq_id >= 0 && (size_t) seq_id < rngs.size()) {
+            rngs[seq_id].seed(0x5eedu + seq_id);
+        }
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -2983,6 +2993,14 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (n_drafting == 0) {
             return;
+        }
+    }
+
+    // a draft model clears q only for the sequences it drafts: when an earlier implementation (n-gram) drafts a
+    // sequence, q would still hold the previous cycle's probabilities and rejection sampling would use them
+    for (auto & dp : dparams) {
+        if (dp.drafting) {
+            dp.q.clear();
         }
     }
 
