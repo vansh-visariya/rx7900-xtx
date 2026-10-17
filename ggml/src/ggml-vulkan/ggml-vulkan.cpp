@@ -15347,6 +15347,117 @@ static bool ggml_vk_replay_match(const ggml_cgraph * cgraph, const vk_graph_repl
     return same_uses && k == e.uses.size();
 }
 
+// GGML_VK_REPLAY_WHY=N diagnostic (stderr): why graphs miss the replay entries. Each miss is counted by its first
+// difference to the closest valid entry (same size and node list first, then the most recently used); the counts
+// print every N misses, with the last old -> new value of a differing field
+static uint64_t ggml_vk_replay_why_every() {
+    static const uint64_t v = [] { const char * e = getenv("GGML_VK_REPLAY_WHY"); return e ? (uint64_t) std::max(0, atoi(e)) : 0; }();
+    return v;
+}
+
+static std::string ggml_vk_replay_field_diff(const ggml_tensor * t, const uint8_t * f) {
+    struct field { const char * name; size_t off, size, elem; };
+    static const field fields[] = {
+        { "type",      offsetof(ggml_tensor, type),      sizeof(ggml_type),                 sizeof(ggml_type) },
+        { "buffer",    offsetof(ggml_tensor, buffer),    sizeof(void *),                    sizeof(void *) },
+        { "ne",        offsetof(ggml_tensor, ne),        sizeof(int64_t) * GGML_MAX_DIMS,   sizeof(int64_t) },
+        { "nb",        offsetof(ggml_tensor, nb),        sizeof(size_t) * GGML_MAX_DIMS,    sizeof(size_t) },
+        { "op",        offsetof(ggml_tensor, op),        sizeof(ggml_op),                   sizeof(ggml_op) },
+        { "op_params", offsetof(ggml_tensor, op_params), GGML_MAX_OP_PARAMS,                sizeof(int32_t) },
+        { "flags",     offsetof(ggml_tensor, flags),     sizeof(int32_t),                   sizeof(int32_t) },
+        { "src",       offsetof(ggml_tensor, src),       sizeof(void *) * GGML_MAX_SRC,     sizeof(void *) },
+        { "view_src",  offsetof(ggml_tensor, view_src),  sizeof(void *),                    sizeof(void *) },
+        { "view_offs", offsetof(ggml_tensor, view_offs), sizeof(size_t),                    sizeof(size_t) },
+        { "data",      offsetof(ggml_tensor, data),      sizeof(void *),                    sizeof(void *) },
+    };
+    const uint8_t * b = (const uint8_t *) t;
+    for (const field & fd : fields) {
+        for (size_t o = fd.off; o < fd.off + fd.size; o += fd.elem) {
+            if (memcmp(b + o, f + o, fd.elem) == 0) {
+                continue;
+            }
+            int64_t a = 0, c = 0;
+            memcpy(&a, f + o, std::min(fd.elem, sizeof(a)));
+            memcpy(&c, b + o, std::min(fd.elem, sizeof(c)));
+            if (fd.elem == sizeof(int32_t)) {
+                a = (int32_t) a;
+                c = (int32_t) c;
+            }
+            const std::string name = fd.size == fd.elem ? fd.name : std::string(fd.name) + "[" + std::to_string((o - fd.off) / fd.elem) + "]";
+            return name + " " + std::to_string(a) + " -> " + std::to_string(c);
+        }
+    }
+    return "?";
+}
+
+static void ggml_vk_replay_why(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    static std::map<std::string, std::pair<uint64_t, std::string>> counts; // reason -> (count, last values)
+    static uint64_t misses = 0;
+    const vk_graph_replay * best = nullptr;
+    int best_rank = -1;
+    for (const auto & e : ctx->replays) {
+        if (!e->valid) {
+            continue;
+        }
+        const int rank = e->cfg[0] != (uint64_t) cgraph->n_nodes ? 0 :
+                         memcmp(cgraph->nodes, e->nodes.data(), e->nodes.size() * sizeof(ggml_tensor *)) != 0 ? 1 : 2;
+        if (rank > best_rank || (rank == best_rank && e->last_use > best->last_use)) {
+            best = e.get();
+            best_rank = rank;
+        }
+    }
+    std::string why, val;
+    if (!best) {
+        why = "no valid entry";
+    } else if (best_rank == 0) {
+        why = "node count";
+        val = std::to_string(best->cfg[0]) + " -> " + std::to_string(cgraph->n_nodes);
+    } else if (best_rank == 1) {
+        int i = 0;
+        while (i < cgraph->n_nodes && cgraph->nodes[i] == best->nodes[i]) {
+            ++i;
+        }
+        why = std::string("node list from ") + cgraph->nodes[i]->name;
+        val = "node " + std::to_string(i);
+    } else if (best->cfg[1] != g_vk_ab.cfg_word() || best->cfg[2] != (uint64_t) g_vk_ab.skip_hash) {
+        why = "switches";
+    } else {
+        const uint8_t * f = best->fields.data();
+        auto check = [&](const ggml_tensor * t) {
+            if (why.empty() && !ggml_vk_replay_fields_eq(t, f)) {
+                const std::string d = ggml_vk_replay_field_diff(t, f);
+                why = std::string(t->name) + " (" + ggml_op_desc(t) + ") " + d.substr(0, d.find(' '));
+                val = d.substr(d.find(' ') + 1);
+            }
+            f += vk_replay_fields;
+        };
+        for (const ggml_tensor * t : best->nodes) {
+            check(t);
+        }
+        for (const ggml_tensor * t : best->ext) {
+            check(t);
+        }
+        if (why.empty()) {
+            why = "use counts";
+        }
+    }
+    auto & c = counts[why];
+    c.first++;
+    c.second = val;
+    if (++misses % ggml_vk_replay_why_every() == 0) {
+        std::vector<std::pair<uint64_t, std::string>> v;
+        for (const auto & kv : counts) {
+            v.emplace_back(kv.second.first, kv.first);
+        }
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "vk_replay_why: %llu misses\n", (unsigned long long) misses);
+        for (size_t j = 0; j < v.size() && j < 12; ++j) {
+            fprintf(stderr, "vk_replay_why: %6llu  %s  [last %s]\n", (unsigned long long) v[j].first, v[j].second.c_str(),
+                    counts[v[j].second].second.c_str());
+        }
+    }
+}
+
 static bool ggml_vk_replay_supported(const ggml_backend_vk_context * ctx) {
 #if defined(GGML_VULKAN_CHECK_RESULTS)
     GGML_UNUSED(ctx);
@@ -15565,6 +15676,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         g_vk_replay_stats.checks++;
+        if (!hit && !busy && ggml_vk_replay_why_every() > 0) {
+            ggml_vk_replay_why(ctx, cgraph);
+        }
         if (g_vk_cpu_timing.enabled) {
             g_vk_replay_stats.check_ms += 1e-3 * (ggml_time_us() - t_k0);
         }
