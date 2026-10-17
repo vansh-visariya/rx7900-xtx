@@ -1798,6 +1798,39 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+void llama_kv_cache::set_input_kq_pos(ggml_tensor * kv_dst, ggml_tensor * q_dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(kv_dst->buffer) && ggml_backend_buffer_is_host(q_dst->buffer));
+    GGML_ASSERT(kv_dst->type == GGML_TYPE_F16 && q_dst->type == GGML_TYPE_F16 && ubatch->n_seqs_unq == 1);
+
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+
+    // as in the host mask: the non-empty cells of a one-sequence cache all hold that sequence
+    const bool single_seq = seq_to_stream.size() == 1;
+
+    // integer positions relative to the lowest one in the batch, which f16 holds exactly (the batch spans < 2048
+    // positions): a cell 2048 or more before it is visible to all its tokens, one 2048 or more after it is hidden from
+    // all, like an empty one
+    llama_pos p_min = ubatch->pos[0];
+    for (uint32_t i = 1; i < ubatch->n_tokens; ++i) {
+        p_min = std::min(p_min, ubatch->pos[i]);
+    }
+
+    const int64_t n_kv = kv_dst->ne[0];
+
+    ggml_fp16_t * kv = (ggml_fp16_t *) kv_dst->data;
+    for (int64_t j = 0; j < n_kv; ++j) {
+        const bool hidden = cells.is_empty(j) || (!single_seq && !cells.seq_has(j, seq_id));
+        const llama_pos rel = hidden ? 2048 : std::clamp<llama_pos>(cells.pos_get(j) - p_min, -2048, 2048);
+        kv[j] = ggml_fp32_to_fp16((float) rel);
+    }
+
+    ggml_fp16_t * q = (ggml_fp16_t *) q_dst->data;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        q[i] = ggml_fp32_to_fp16((float) (ubatch->pos[i] - p_min + 1));
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2809,6 +2842,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_pos(ggml_tensor * kv_dst, ggml_tensor * q_dst, const llama_ubatch * ubatch) const {
+    kv->set_input_kq_pos(kv_dst, q_dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

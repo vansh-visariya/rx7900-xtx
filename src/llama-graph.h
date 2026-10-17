@@ -360,6 +360,10 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // positions of a causal mask built on the device instead of self_kq_mask
+    ggml_tensor * kq_pos_kv = nullptr; // F16 [n_kv, 1]
+    ggml_tensor * kq_pos_q  = nullptr; // F16 [1, n_batch]
+
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;

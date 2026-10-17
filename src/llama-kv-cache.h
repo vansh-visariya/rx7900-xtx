@@ -229,6 +229,10 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // positions for a causal mask built on the device (f16, relative to the lowest position in the batch): kv_dst [n_kv]
+    // per cell (2048 when empty or of another sequence), q_dst [n_tokens] per token + 1
+    void set_input_kq_pos(ggml_tensor * kv_dst, ggml_tensor * q_dst, const llama_ubatch * ubatch) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -422,6 +426,8 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    void set_input_kq_pos(ggml_tensor * kv_dst, ggml_tensor * q_dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
