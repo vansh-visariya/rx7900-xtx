@@ -988,6 +988,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_gated_delta_net_replay[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1260,6 +1261,15 @@ class vk_perf_logger {
 
 // conv of a recurrent layer with its state path (get_rows of the conv cache, concat with the new inputs, snapshot
 // copies of the state windows back into the cache) run as one kernel at the concat (ssm_conv_state.comp)
+// gated_delta_net_replay that reads its state and log from the cache rows and writes them back itself
+// (ggml_vk_match_gdn_replay): the gathering get_rows and the cpy / set_rows into the cache are skipped
+struct vk_gdn_replay_fusion {
+    const ggml_tensor * state_rows = nullptr; // get_rows of the state cache
+    const ggml_tensor * log_rows   = nullptr; // get_rows of the log cache
+    const ggml_tensor * state_cpy  = nullptr; // cpy of the new state into the state cache rows
+    const ggml_tensor * log_set    = nullptr; // set_rows of the new log into the log cache
+};
+
 struct vk_conv_state_fusion {
     const ggml_tensor * rows = nullptr; // get_rows of the conv cache
     const ggml_tensor * x    = nullptr; // new inputs [channels, n_t, n_s]
@@ -1330,7 +1340,10 @@ struct ggml_backend_vk_context {
     // ggml_vk_gdn_state_rows; the conv state path, ggml_vk_match_conv_state), and the concats that run the fused
     // conv state kernel
     std::unordered_set<const ggml_tensor *> fused_skip;
+    // gated_delta_net -> the get_rows of the state cache it reads in place
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> gdn_state_fusions;
     std::unordered_map<const ggml_tensor *, vk_conv_state_fusion> conv_state_fusions;
+    std::unordered_map<const ggml_tensor *, vk_gdn_replay_fusion> gdn_replay_fusions;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.

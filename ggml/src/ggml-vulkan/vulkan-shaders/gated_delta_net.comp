@@ -34,6 +34,9 @@ layout(push_constant) uniform Parameters {
     uint K;
     uint n_snap, snap_seq_stride, snap_slot_stride;
     uint state_row;
+    uint log_E, log_R, log_row, log_out_off;
+    uint state_w_off;
+    uint idx_off, log_r_off, log_w_off, nrep_off;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -41,12 +44,43 @@ layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
 layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
 layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
+#if GDN_REPLAY
+// replay: the state and the update log (entry: k [S_V*neq1] | delta [S_V*H] | exp(g) [H, or S_V*H for KDA]), and the
+// new state and log go to dst after the scores. log_row != 0: the state and log bindings are the caches instead, a
+// sequence's state is read from row idx[seq] and written at state_w_off, its log read from row log_r[seq] and written
+// to row log_w[seq]. the int bindings start at their *_off element
+layout(binding = 5)           buffer StateBuf { FLOAT_TYPE data_state[]; };
+layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+layout(binding = 7)           buffer LogBuf   { FLOAT_TYPE data_log[];   };
+layout(binding = 8)  readonly buffer IdxBuf   { int data_idx[];   };
+layout(binding = 9)  readonly buffer LogRBuf  { int data_log_r[]; };
+layout(binding = 10) readonly buffer LogWBuf  { int data_log_w[]; };
+// log entries to replay
+layout(binding = 11) readonly buffer NRepBuf  { int data_nrep[];  };
+
+void store_state(uint i, FLOAT_TYPE v) {
+    if (log_row != 0u) {
+        data_state[i] = v;
+    } else {
+        data_dst[i] = v;
+    }
+}
+
+void store_log(uint i, FLOAT_TYPE v) {
+    if (log_row != 0u) {
+        data_log[i] = v;
+    } else {
+        data_dst[i] = v;
+    }
+}
+#else
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 // external snapshot target when n_snap > 0 (bound to dst otherwise)
 layout(binding = 7)           buffer SnapBuf  { FLOAT_TYPE data_snap[];  };
 // cache row of each sequence's state when state_row != 0
 layout(binding = 8) readonly  buffer IdxBuf   { int data_idx[]; };
+#endif
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -110,8 +144,13 @@ void main() {
     const uint state_size = S_V * S_V;
     // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
     // or, read in place from the recurrent cache: each lane loads its elements before writing them as snapshots
+#if GDN_REPLAY
+    const uint state_in_base       = log_row != 0u ? uint(data_idx[idx_off + seq_id]) * state_row + head_id * state_size
+                                                   : (seq_id * H + head_id) * state_size;
+#else
     const uint state_in_base       = state_row != 0u ? uint(data_idx[seq_id]) * state_row + head_id * state_size
                                                      : (seq_id * H + head_id) * state_size;
+#endif
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
@@ -120,6 +159,45 @@ void main() {
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
         s_shard[r] = FLOAT_TYPE(data_state[state_in_base + col * S_V + r * LANES_PER_COLUMN + lane]);
     }
+
+#if GDN_REPLAY
+    const uint log_d_off = neq1 * S_V;
+    const uint log_g_off = log_d_off + H * S_V;
+    const uint log_in_base  = log_row != 0u ? uint(data_log_r[log_r_off + seq_id]) * log_row : seq_id * log_R * log_E;
+    const uint log_out_base = log_row != 0u ? uint(data_log_w[log_w_off + seq_id]) * log_row : log_out_off + seq_id * log_R * log_E;
+
+    // apply the logged updates: the token update below with the stored k, delta and exp(g)
+    const uint n_rep = uint(data_nrep[nrep_off + seq_id]);
+    for (uint i = 0; i < n_rep; i++) {
+        const uint e = log_in_base + i * log_E;
+        FLOAT_TYPE g_rep[ROWS_PER_LANE];
+        if (KDA == 0) {
+            const FLOAT_TYPE g_val = FLOAT_TYPE(data_log[e + log_g_off + head_id]);
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                g_rep[r] = g_val;
+            }
+        } else {
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                g_rep[r] = FLOAT_TYPE(data_log[e + log_g_off + head_id * S_V + r * LANES_PER_COLUMN + lane]);
+            }
+        }
+        const FLOAT_TYPE d_rep = FLOAT_TYPE(data_log[e + log_d_off + head_id * S_V + col]);
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            const FLOAT_TYPE k_rep = FLOAT_TYPE(data_log[e + iq1 * S_V + r * LANES_PER_COLUMN + lane]);
+            s_shard[r] = fma(k_rep, d_rep, g_rep[r] * s_shard[r]);
+        }
+    }
+
+    // tokens t_log.. are logged; the state before token t_log is written
+    const uint n_log = min(n_tokens, log_R);
+    const uint t_log = n_tokens - n_log;
+    const uint base_out = log_row != 0u ? state_w_off + seq_id * state_row + head_id * state_size : s_off + state_out_base;
+    if (t_log == 0u) {
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            store_state(base_out + col * S_V + r * LANES_PER_COLUMN + lane, s_shard[r]);
+        }
+    }
+#endif
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -178,6 +256,36 @@ void main() {
 
         attn_off += S_V * H;
 
+#if GDN_REPLAY
+        if (t >= t_log) {
+            const uint e = log_out_base + (t - t_log) * log_E;
+            if (lane == 0u) {
+                store_log(e + log_d_off + head_id * S_V + col, delta_col);
+            }
+            // exp(g) of a head and k of a k head are written by column 0
+            if (col == 0u) {
+                if (KDA == 0) {
+                    if (lane == 0u) {
+                        store_log(e + log_g_off + head_id, g_exp[0]);
+                    }
+                } else {
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                        store_log(e + log_g_off + head_id * S_V + r * LANES_PER_COLUMN + lane, g_exp[r]);
+                    }
+                }
+                if (head_id < neq1) {
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                        store_log(e + head_id * S_V + r * LANES_PER_COLUMN + lane, k_reg[r]);
+                    }
+                }
+            }
+        }
+        if (t + 1u == t_log) {
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                store_state(base_out + col * S_V + r * LANES_PER_COLUMN + lane, s_shard[r]);
+            }
+        }
+#else
         if (K > 1u) {
             const int target_slot = int(n_tokens) - 1 - int(t);
             if (n_snap > 0u) {
@@ -194,8 +302,34 @@ void main() {
                 }
             }
         }
+#endif
     }
 
+#if GDN_REPLAY
+    // unused log entries are zero
+    for (uint j = n_log; j < log_R; j++) {
+        const uint e = log_out_base + j * log_E;
+        if (lane == 0u) {
+            store_log(e + log_d_off + head_id * S_V + col, FLOAT_TYPE(0));
+        }
+        if (col == 0u) {
+            if (KDA == 0) {
+                if (lane == 0u) {
+                    store_log(e + log_g_off + head_id, FLOAT_TYPE(0));
+                }
+            } else {
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    store_log(e + log_g_off + head_id * S_V + r * LANES_PER_COLUMN + lane, FLOAT_TYPE(0));
+                }
+            }
+            if (head_id < neq1) {
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    store_log(e + head_id * S_V + r * LANES_PER_COLUMN + lane, FLOAT_TYPE(0));
+                }
+            }
+        }
+    }
+#else
     if (K == 1u) {
         if (n_snap > 0u) {
             const uint slot_base = seq_id * snap_seq_stride + head_id * state_size;
@@ -208,4 +342,5 @@ void main() {
             }
         }
     }
+#endif
 }

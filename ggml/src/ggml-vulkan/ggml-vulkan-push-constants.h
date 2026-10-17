@@ -686,7 +686,16 @@ struct vk_op_gated_delta_net_push_constants {
     // state_row != 0: the state binding is the recurrent cache, a sequence's state starts at row idx[seq] (rows of
     // state_row floats) instead of being a gathered [D, n_seqs] copy
     uint32_t state_row;
+    // gated_delta_net_replay: log entry floats and count; log_row != 0: the state and log bindings are the caches (log
+    // rows of log_row floats, state rows of state_row floats, the new state written at state_w_off), else the log is a
+    // [log_E, log_R, n_seqs] source and the new state and log go to dst at s_off and log_out_off
+    uint32_t log_E, log_R, log_row, log_out_off;
+    uint32_t state_w_off;
+    // first element of the state rows, log read rows, log write rows and replay counts in their bindings
+    uint32_t idx_off, log_r_off, log_w_off, nrep_off;
 };
+
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
