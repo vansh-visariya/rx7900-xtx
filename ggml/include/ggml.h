@@ -581,6 +581,7 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_GATED_DELTA_NET_REPLAY,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2658,6 +2659,27 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // gated delta net that logs its state updates instead of writing state snapshots: rollback by replay
+    //   q, k, v, g, beta, state : as ggml_gated_delta_net
+    //   log      : [E, R, n_seqs] update log of the previous call, R >= 1 entries of E floats each:
+    //              k [S_k*H_k] | delta [S_v*H_v] | exp(g) [H_v, or S_v*H_v for KDA]
+    //   n_replay : I32 [n_seqs], number of log entries applied to state before the first token (<= R)
+    //
+    // with m = min(n_tokens, R), the output packs the attention scores [S_v, H_v, n_tokens, n_seqs], the state
+    // before token n_tokens-m [S_v, S_v, H_v, n_seqs] and the log of the last m tokens [E, R, n_seqs] (entries
+    // m..R-1 are zero). the state after the first n_tokens-m+j tokens is that state with j log entries applied:
+    // s = fma(k, delta, exp(g)*s) per element, the same expression as the token update.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * log,
+            struct ggml_tensor  * n_replay);
 
     // DSA lightning indexer
     //
