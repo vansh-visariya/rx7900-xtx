@@ -4924,6 +4924,218 @@ struct test_gated_delta_net_state_rows : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET_REPLAY
+struct test_gated_delta_net_replay : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int     v_repeat;
+    const bool    kda;
+    const int64_t R;     // log entries
+    const int64_t n_rep; // replayed entries of seq 0, seq s replays (n_rep + s) % (R + 1)
+
+    std::string vars() override {
+        return VARS_TO_STR8(head_count, head_size, n_seq_tokens, n_seqs, v_repeat, kda, R, n_rep);
+    }
+
+    test_gated_delta_net_replay(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 5,
+            int64_t n_seqs = 1, int v_repeat = 1, bool kda = false, int64_t R = 4, int64_t n_rep = 2)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          v_repeat(v_repeat), kda(kda), R(R), n_rep(n_rep) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H_v   = head_count * v_repeat;
+        const int64_t g_ne0 = kda ? head_size : 1;
+        const int64_t E     = head_size * head_count + head_size * H_v + g_ne0 * H_v;
+
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, g_ne0, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, H_v, n_seqs);
+        ggml_tensor * log   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, R, n_seqs);
+        ggml_tensor * nrep  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(state, "state");
+        ggml_set_name(log, "log");
+        ggml_set_name(nrep, "nrep");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        return ggml_gated_delta_net_replay(ctx, q, k, v, g, beta, state, log, nrep);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "nrep") == 0) {
+                std::vector<int32_t> n(n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    n[s] = (int32_t) ((n_rep + s) % (R + 1));
+                }
+                ggml_backend_tensor_set(t, n.data(), 0, n.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "log") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// the replay path as llama builds it: state and log gathered from cache rows, state and log written back
+// (CPY into the state rows, SET_ROWS into the other parity of the log rows); log rows of a cell: parity * mem + cell.
+// the index arrays are views of one tensor, or (split) separate tensors as the scheduler copies them to the backend
+struct test_gated_delta_net_replay_cache : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int     v_repeat;
+    const int64_t R;
+    const int64_t n_rep;
+    const int     parity;
+    const bool    split;
+
+    ggml_tensor * cpy_node  = nullptr;
+    ggml_tensor * log_node  = nullptr;
+    ggml_tensor * attn_node = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR9(head_count, head_size, n_seq_tokens, n_seqs, v_repeat, R, n_rep, parity, split);
+    }
+
+    test_gated_delta_net_replay_cache(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 5,
+            int64_t n_seqs = 1, int v_repeat = 1, int64_t R = 4, int64_t n_rep = 2, int parity = 0, bool split = false)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          v_repeat(v_repeat), R(R), n_rep(n_rep), parity(parity), split(split) {}
+
+    // one spare cell after the sequences
+    int64_t mem_size() const { return n_seqs + 1; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S_v = head_size;
+        const int64_t H_v = head_count * v_repeat;
+        const int64_t D   = S_v * S_v * H_v;
+        const int64_t E   = head_size * head_count + head_size * H_v + H_v;
+
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * cache     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, mem_size());
+        ggml_tensor * log_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E * R, 2 * mem_size());
+        ggml_set_name(cache, "cache");
+        ggml_set_name(log_cache, "log_cache");
+
+        // rows: state, log read, log write, replay count
+        ggml_tensor * idx_s, * idx_lr, * idx_lw, * nrep;
+        if (split) {
+            idx_s  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            idx_lr = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            idx_lw = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            nrep   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(idx_s,  "info0");
+            ggml_set_name(idx_lr, "info1");
+            ggml_set_name(idx_lw, "info2");
+            ggml_set_name(nrep,   "info3");
+        } else {
+            ggml_tensor * info = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_seqs, 4);
+            ggml_set_name(info, "info");
+            idx_s  = ggml_view_1d(ctx, info, n_seqs, 0 * info->nb[1]);
+            idx_lr = ggml_view_1d(ctx, info, n_seqs, 1 * info->nb[1]);
+            idx_lw = ggml_view_1d(ctx, info, n_seqs, 2 * info->nb[1]);
+            nrep   = ggml_view_1d(ctx, info, n_seqs, 3 * info->nb[1]);
+        }
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * state = ggml_get_rows(ctx, cache, idx_s);
+        state = ggml_reshape_4d(ctx, state, S_v, S_v, H_v, n_seqs);
+        ggml_tensor * log = ggml_get_rows(ctx, log_cache, idx_lr);
+        log = ggml_reshape_3d(ctx, log, E, R, n_seqs);
+
+        ggml_tensor * out = ggml_gated_delta_net_replay(ctx, q, k, v, g, beta, state, log, nrep);
+
+        const int64_t n_attn = S_v * H_v * n_seq_tokens * n_seqs;
+        ggml_tensor * attn = ggml_view_1d(ctx, out, n_attn, 0);
+        ggml_set_name(attn, "attn");
+        attn_node = attn;
+
+        ggml_tensor * state_new = ggml_view_2d(ctx, out, D, n_seqs, ggml_row_size(out->type, D), ggml_row_size(out->type, n_attn));
+        ggml_tensor * cpy = ggml_cpy(ctx, state_new, ggml_view_2d(ctx, cache, D, n_seqs, cache->nb[1], 0));
+        ggml_set_name(cpy, "gdn_state_cpy");
+        cpy_node = cpy;
+
+        ggml_tensor * log_new = ggml_view_2d(ctx, out, E * R, n_seqs, ggml_row_size(out->type, E * R),
+                ggml_row_size(out->type, n_attn + D * n_seqs));
+        ggml_tensor * log_set = ggml_set_rows(ctx, log_cache, log_new, idx_lw);
+        ggml_set_name(log_set, "gdn_log_set");
+        log_node = log_set;
+
+        return ggml_add(ctx, ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, log_set)), ggml_sum(ctx, attn));
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_REPLAY_CACHE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, log_node, attn_node }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strncmp(t->name, "info", 4) == 0) {
+                std::vector<int32_t> rows(4 * n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    rows[0 * n_seqs + s] = (int32_t) s;
+                    rows[1 * n_seqs + s] = (int32_t) (parity * mem_size() + s);
+                    rows[2 * n_seqs + s] = (int32_t) ((1 - parity) * mem_size() + s);
+                    rows[3 * n_seqs + s] = (int32_t) ((n_rep + s) % (R + 1));
+                }
+                if (t->name[4] == 0) {
+                    ggml_backend_tensor_set(t, rows.data(), 0, rows.size() * sizeof(int32_t));
+                } else {
+                    ggml_backend_tensor_set(t, rows.data() + (t->name[4] - '0') * n_seqs, 0, n_seqs * sizeof(int32_t));
+                }
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "log_cache") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -5230,6 +5442,18 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// MUL_MAT at the weight types and shapes of a real model (Qwen3.8-27B UD-Q4_K_M), under its own name because the cases
+// are heavy: test-backend-ops -o MUL_MAT_MODEL
+struct test_mul_mat_model : public test_mul_mat {
+    test_mul_mat_model(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_MODEL";
     }
 };
 
@@ -11423,6 +11647,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_vec_epilogue(type, mode, 1024, 5, 512));
         }
     }
+    // the gate prep of Qwen3.8-27B UD-Q4_K_M: Q8_0 alpha / beta projections, 48 x 5120
+    for (int mode : {0, 1, 2}) {
+        for (int64_t n : {1, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat_vec_epilogue(GGML_TYPE_Q8_0, mode, 48, n, 5120));
+        }
+    }
+
+    // Qwen3.8-27B UD-Q4_K_M weights: type, rows, inner size (the LM head at a tenth of its 248320 rows)
+    {
+        struct mm_shape { ggml_type type; int64_t m, k; };
+        const mm_shape shapes[] = {
+            { GGML_TYPE_Q8_0,      48,  5120 }, { GGML_TYPE_Q8_0,   1024,  5120 },
+            { GGML_TYPE_Q5_K,   10240,  5120 }, { GGML_TYPE_Q5_K,   6144,  5120 }, { GGML_TYPE_Q5_K,   5120,  6144 },
+            { GGML_TYPE_Q5_K,   17408,  5120 }, { GGML_TYPE_Q5_K,   5120, 17408 }, { GGML_TYPE_Q5_K,   1024,  5120 },
+            { GGML_TYPE_Q4_K,   10240,  5120 }, { GGML_TYPE_Q4_K,   6144,  5120 }, { GGML_TYPE_Q4_K,  17408,  5120 },
+            { GGML_TYPE_Q4_K,    5120, 17408 },
+            { GGML_TYPE_Q6_K,    5120,  6144 }, { GGML_TYPE_Q6_K,  17408,  5120 }, { GGML_TYPE_Q6_K,   5120, 17408 },
+            { GGML_TYPE_Q6_K,    1024,  5120 }, { GGML_TYPE_Q6_K,  24832,  5120 },
+            { GGML_TYPE_Q3_K,   17408,  5120 }, { GGML_TYPE_Q3_K,   5120, 17408 },
+            { GGML_TYPE_IQ4_NL, 10240,  5120 }, { GGML_TYPE_IQ4_NL, 17408, 5120 }, { GGML_TYPE_IQ4_NL, 5120, 17408 },
+            { GGML_TYPE_IQ4_XS, 10240,  5120 }, { GGML_TYPE_IQ4_XS, 17408, 5120 }, { GGML_TYPE_IQ4_XS, 5120, 17408 },
+            { GGML_TYPE_IQ3_S,  17408,  5120 }, { GGML_TYPE_IQ3_S,  5120, 17408 },
+        };
+        for (const mm_shape & sh : shapes) {
+            for (int64_t n : {1, 5, 64}) {
+                test_cases.emplace_back(new test_mul_mat_model(sh.type, sh.m, n, sh.k));
+            }
+            // a prompt batch (slow on the CPU reference for i-quants)
+            if (sh.m == 17408 && sh.type != GGML_TYPE_IQ3_S) {
+                test_cases.emplace_back(new test_mul_mat_model(sh.type, sh.m, 512, sh.k));
+            }
+        }
+    }
 
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
@@ -11530,6 +11787,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_state(10240, 5, 1, 5, 1));
     test_cases.emplace_back(new test_ssm_conv_state(256,  16, 1, 5, 0));
     test_cases.emplace_back(new test_ssm_conv_state(256,  20, 1, 5, 0));
+    // rollback by replay: the verify shape (5 tokens, 4 log entries), short batches, GQA, KDA, several seqs
+    for (int64_t n_rep : {0, 1, 4}) {
+        test_cases.emplace_back(new test_gated_delta_net_replay(4,  32, 5, 1, 1, false, 4, n_rep));
+        test_cases.emplace_back(new test_gated_delta_net_replay(8, 128, 5, 1, 3, false, 4, n_rep));
+    }
+    test_cases.emplace_back(new test_gated_delta_net_replay(4,  64, 1, 1, 1, false, 4, 1));
+    test_cases.emplace_back(new test_gated_delta_net_replay(4,  64, 3, 2, 1, false, 4, 3));
+    test_cases.emplace_back(new test_gated_delta_net_replay(4,  64, 9, 3, 2, false, 3, 2));
+    test_cases.emplace_back(new test_gated_delta_net_replay(4,  16, 4, 2, 1, true,  4, 2));
+    test_cases.emplace_back(new test_gated_delta_net_replay(4,  64, 64, 1, 1, false, 4, 4));
+    for (int parity : {0, 1}) {
+        test_cases.emplace_back(new test_gated_delta_net_replay_cache(4,  32, 5, 1, 1, 4, 2, parity));
+        test_cases.emplace_back(new test_gated_delta_net_replay_cache(8, 128, 5, 1, 3, 4, 3, parity));
+    }
+    test_cases.emplace_back(new test_gated_delta_net_replay_cache(4,  64, 1, 1, 1, 4, 1, 0));
+    test_cases.emplace_back(new test_gated_delta_net_replay_cache(4,  64, 5, 2, 1, 4, 0, 1));
+    test_cases.emplace_back(new test_gated_delta_net_replay_cache(4,  64, 64, 1, 1, 4, 4, 0));
+    for (int parity : {0, 1}) {
+        test_cases.emplace_back(new test_gated_delta_net_replay_cache(16, 128, 5, 1, 3, 4, 3, parity, true));
+    }
+    test_cases.emplace_back(new test_gated_delta_net_replay_cache(4,  64, 5, 2, 1, 4, 2, 0, true));
+    test_cases.emplace_back(new test_gated_delta_net_replay_cache(4,  64, 64, 1, 1, 4, 4, 1, true));
     test_cases.emplace_back(new test_gated_delta_net_state_rows(4,  32, 5, 1, 5, 2));
     test_cases.emplace_back(new test_gated_delta_net_state_rows(4,  32, 5, 1, 5, 0));
     test_cases.emplace_back(new test_gated_delta_net_state_rows(4,  32, 3, 1, 5, 4));
