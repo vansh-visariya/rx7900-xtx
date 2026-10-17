@@ -1134,7 +1134,8 @@ vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buff
 //   GGML_VK_FUSE_Q8_1=0     producers do not write the q8_1 copy for the next integer mat-vec
 //   GGML_VK_FUSE_MMV_ADD=0  no residual ADD fusion into mat-vecs of 2-8 columns
 //   GGML_VK_FUSE_GDN_STATE=0  gated_delta_net reads a gathered copy of its state instead of the cache row
-//   GGML_VK_FUSE_CONV_STATE=0 the conv state path of recurrent layers runs as separate nodes
+//   GGML_VK_FUSE_CONV_STATE=0 the conv state path of recurrent layers runs as separate nodes; 2 test: the fused
+//                           kernel always reads a copy of its new inputs (the path for an output that overlaps them)
 //   GGML_VK_FUSE_MMV_EPI=0  no bias/activation/scale epilogues on mat-vecs (ggml_vk_match_mmv_epilogue)
 //   GGML_VK_SKIP_OPS=OP[:src0type],...  diagnostic: skip matching nodes (and their fused followers) to measure their
 //                           in-graph cost, results are wrong while set. QUANTIZE_Q8_1 skips the mat-vec input quantize
@@ -1148,6 +1149,7 @@ struct ggml_vk_ab_env {
     bool                     fuse_mmv_add  = true;
     bool                     fuse_gdn_state = true;
     bool                     fuse_conv_state = true;
+    bool                     conv_state_stage = false;
     bool                     fuse_mmv_epi  = true;
     bool                     submit_at_end = false;
     int                      graph_replay  = 0;
@@ -1156,7 +1158,8 @@ struct ggml_vk_ab_env {
     // the switches that change how a graph is recorded, part of a replay key
     uint64_t cfg_word() const {
         return (uint64_t) fuse_q8_1 | (uint64_t) fuse_mmv_add << 1 | (uint64_t) fuse_gdn_state << 2 |
-               (uint64_t) fuse_conv_state << 3 | (uint64_t) submit_at_end << 4 | (uint64_t) fuse_mmv_epi << 5;
+               (uint64_t) fuse_conv_state << 3 | (uint64_t) submit_at_end << 4 | (uint64_t) fuse_mmv_epi << 5 |
+               (uint64_t) conv_state_stage << 6;
     }
 
     void refresh() {
@@ -1186,6 +1189,7 @@ struct ggml_vk_ab_env {
         fuse_gdn_state = !gs || atoi(gs) != 0;
         const char * cs = getenv("GGML_VK_FUSE_CONV_STATE");
         fuse_conv_state = !cs || atoi(cs) != 0;
+        conv_state_stage = cs && atoi(cs) == 2;
         const char * me = getenv("GGML_VK_FUSE_MMV_EPI");
         fuse_mmv_epi = !me || atoi(me) != 0;
         const char * se = getenv("GGML_VK_SUBMIT_AT_END");
@@ -10396,11 +10400,30 @@ static void ggml_vk_ssm_conv_state(ggml_backend_vk_context * ctx, vk_context& su
         pc.snap_row[k] = f.snap_row[k];
     }
 
+    vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, f.x);
+    if (f.stage_x) {
+        // the output overlaps x where other threads read it: copy x away first
+        const size_t x_sz = ggml_nbytes(f.x);
+        if (ctx->prealloc_size_x < x_sz) {
+            ctx->prealloc_size_x = x_sz;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_vk_buffer_copy_async(subctx, ctx->prealloc_x, 0, x_buf.buffer, x_buf.offset, x_sz);
+        ggml_vk_sync_buffers(ctx, subctx);
+        x_buf = { ctx->prealloc_x, 0, x_sz };
+    }
+
     vk_subbuffer cache_buf = ggml_vk_tensor_subbuffer(ctx, cache);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { cache_buf, ggml_vk_tensor_subbuffer(ctx, idx), ggml_vk_tensor_subbuffer(ctx, f.x),
+        { cache_buf, ggml_vk_tensor_subbuffer(ctx, idx), x_buf,
           ggml_vk_tensor_subbuffer(ctx, kern), ggml_vk_tensor_subbuffer(ctx, dst), cache_buf },
         pc, { pc.nr, pc.n_s, 1 });
+    if (f.stage_x) {
+        ctx->prealloc_x_need_sync = true;
+    }
 }
 
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
@@ -12364,8 +12387,8 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
 
 // a recurrent layer's conv state path at its concat (vk_conv_state_fusion): concat(reshape(get_rows(cache, idx)),
 // transpose(x)) used only by views of the state windows, each copied into a cache row, and by ssm_conv + silu. The
-// kernel runs at the concat and writes the silu output there, so that output must not alias x, which is read there.
-// Small batches only (the kernel loops over the tokens).
+// kernel runs at the concat and writes the silu output there, where it also reads x: ggml-alloc can give the freed x
+// to the conv output (see the overlap check). Small batches only (the kernel loops over the tokens).
 // In-place cache fusions run at one node's position the work of nodes elsewhere in the graph. ggml-alloc frees a tensor
 // after its last use and gives the memory to later nodes, so the kernel may read a source of a skipped node only if no
 // node in between writes that memory (the scheduler's copy of a row index is freed after the last layer's get_rows),
@@ -12559,18 +12582,27 @@ static bool ggml_vk_match_conv_state(const ggml_backend_vk_context * ctx, const 
         }
     }
 
-    // a thread reads all of its channel's inputs before it writes, so the output may be x itself (same offset and
-    // strides), but not overlap it otherwise
+    // one thread per channel reads all of its inputs before it writes its outputs. So the output may overlap x if each
+    // output that lands on x lands on an input of its own thread that it is computed from: equal token strides and an
+    // output that starts 0 to NS token rows before x (output t on input t - m, m <= NS, one of its own conv inputs).
+    // (Qwen3.8-27B with LLAMA_KQ_MASK_GPU=1: 2 or 3 rows before x in every layer.) Any other overlap would let a thread
+    // overwrite inputs that another workgroup has not read yet: the kernel then reads a copy of x (stage_x)
+    f.stage_x = g_vk_ab.conv_state_stage;
     if (f.silu->buffer == x->buffer) {
         const size_t a0 = vk_tensor_offset(f.silu) + f.silu->view_offs, a1 = a0 + ggml_nbytes(f.silu);
         const size_t b0 = vk_tensor_offset(x) + x->view_offs,           b1 = b0 + ggml_nbytes(x);
-        const bool same = a0 == b0 && f.silu->nb[1] == x->nb[1] && f.silu->nb[2] == x->nb[2];
-        if (a0 < b1 && b0 < a1 && !same) {
+        const size_t row = x->nb[1];
+        const bool own = f.silu->nb[1] == row && row >= nr * sizeof(float) && a0 <= b0 && (b0 - a0) % row == 0 &&
+                         (b0 - a0) / row <= (size_t) NS;
+        if (a0 < b1 && b0 < a1 && !own) {
             if (ggml_vk_fuse_alias_log()) {
-                fprintf(stderr, "ggml_vulkan: conv state at node %d not fused: silu output [%zu, %zu) partly overlaps x [%zu, %zu)\n",
+                fprintf(stderr, "ggml_vulkan: conv state at node %d stages x: silu output [%zu, %zu) partly overlaps x [%zu, %zu)\n",
                         node_idx, a0, a1, b0, b1);
             }
-            return false;
+            f.stage_x = true;
+        } else if (a0 < b1 && b0 < a1 && ggml_vk_fuse_alias_log()) {
+            fprintf(stderr, "ggml_vulkan: conv state at node %d: silu output starts %zu rows before x (in place)\n",
+                    node_idx, (b0 - a0) / row);
         }
     }
 
