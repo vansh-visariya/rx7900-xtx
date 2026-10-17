@@ -15,6 +15,10 @@
 #include <map>
 #include <stdexcept>
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#endif
+
 // the device can run the delta-net replay op with these shapes
 static bool llama_gdn_replay_supported(ggml_backend_dev_t dev, uint32_t s_k, uint32_t h_k, uint32_t s_v, uint32_t h_v, uint32_t n_log) {
     ggml_init_params params = {
@@ -989,6 +993,38 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
+// s[i] = fma(k[i], d, g * s[i]): one update of a logged delta-net state row. libllama is built without FMA, where fmaf
+// is a libm call per element (~0.5 s for the 4 pending entries of a 27B checkpoint), so x86 with AVX2 + FMA takes a
+// vector path; both round g * s once and the fma once, so the bytes are the same
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2,fma")))
+static void gdn_log_update_fma(float * s, const float * k, float d, float g, uint32_t n) {
+    const __m256 vd = _mm256_set1_ps(d);
+    const __m256 vg = _mm256_set1_ps(g);
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 vs = _mm256_mul_ps(vg, _mm256_loadu_ps(s + i));
+        _mm256_storeu_ps(s + i, _mm256_fmadd_ps(_mm256_loadu_ps(k + i), vd, vs));
+    }
+    for (; i < n; ++i) {
+        s[i] = fmaf(k[i], d, g * s[i]);
+    }
+}
+#endif
+
+static void gdn_log_update(float * s, const float * k, float d, float g, uint32_t n) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    static const bool has_fma = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    if (has_fma) {
+        gdn_log_update_fma(s, k, d, g, n);
+        return;
+    }
+#endif
+    for (uint32_t i = 0; i < n; ++i) {
+        s[i] = fmaf(k[i], d, g * s[i]);
+    }
+}
+
 void llama_memory_recurrent::state_get_logged(uint32_t il, const log_cell & lc, std::vector<float> & state) const {
     const size_t n_state = hparams.n_embd_s();
     state.resize(n_state);
@@ -1010,10 +1046,7 @@ void llama_memory_recurrent::state_get_logged(uint32_t il, const log_cell & lc, 
             const float   g = ent[g_off + h];
             for (uint32_t j = 0; j < gdn_s_v; ++j) {
                 const float d = ent[d_off + h * gdn_s_v + j];
-                float * sj = state.data() + ((size_t) h * gdn_s_v + j) * gdn_s_v;
-                for (uint32_t i = 0; i < gdn_s_v; ++i) {
-                    sj[i] = fmaf(k[i], d, g * sj[i]);
-                }
+                gdn_log_update(state.data() + ((size_t) h * gdn_s_v + j) * gdn_s_v, k, d, g, gdn_s_v);
             }
         }
     }
