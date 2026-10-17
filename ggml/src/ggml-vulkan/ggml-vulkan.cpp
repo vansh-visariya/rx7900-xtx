@@ -12543,11 +12543,18 @@ static bool ggml_vk_match_conv_state(const ggml_backend_vk_context * ctx, const 
         }
     }
     if (!f.conv || n_views == 0 || uses(cat) != n_views + 1) {
+        if (ggml_vk_fuse_alias_log()) {
+            fprintf(stderr, "ggml_vulkan: conv state at node %d not fused: conv %d, snapshot views %d, concat uses %d\n",
+                    node_idx, f.conv != nullptr, n_views, uses(cat));
+        }
         return false;
     }
 
     for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ cache, idx, x, f.conv->src[1], f.silu }) {
         if (get_misalign_bytes(ctx, t) != 0) {
+            if (ggml_vk_fuse_alias_log()) {
+                fprintf(stderr, "ggml_vulkan: conv state at node %d not fused: %s misaligned\n", node_idx, t->name);
+            }
             return false;
         }
     }
@@ -12559,6 +12566,10 @@ static bool ggml_vk_match_conv_state(const ggml_backend_vk_context * ctx, const 
         const size_t b0 = vk_tensor_offset(x) + x->view_offs,           b1 = b0 + ggml_nbytes(x);
         const bool same = a0 == b0 && f.silu->nb[1] == x->nb[1] && f.silu->nb[2] == x->nb[2];
         if (a0 < b1 && b0 < a1 && !same) {
+            if (ggml_vk_fuse_alias_log()) {
+                fprintf(stderr, "ggml_vulkan: conv state at node %d not fused: silu output [%zu, %zu) partly overlaps x [%zu, %zu)\n",
+                        node_idx, a0, a1, b0, b1);
+            }
             return false;
         }
     }
