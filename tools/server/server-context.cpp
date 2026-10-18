@@ -4002,7 +4002,10 @@ private:
             // verify and try to accept the draft
             {
                 common_spec_trace("accept_begin");
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // the copy is restored only when a partial acceptance restores the checkpoint (use_ckpt_tgt below)
+                const bool may_restore = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                common_sampler_ptr smpl_save(may_restore ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const int64_t t_accept_start = ggml_time_us();
