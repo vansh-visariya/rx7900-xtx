@@ -1292,6 +1292,7 @@ struct vk_graph_replay {
     std::vector<const ggml_tensor *> ext;  // sources and view sources that are not nodes of the graph, each once
     std::vector<uint8_t> fields;           // the fields before the name, of each node, then of each of ext
     std::vector<std::pair<const ggml_tensor *, int32_t>> uses; // used slots of the graph's hash set, in slot order
+    uint64_t uid = 0;                      // uid of the last graph that matched the key (0: none)
     uint64_t epoch = 0;                    // device buffer_epoch at recording
     vk_command_pool pool;                  // reusable, its own: the context pool is reset after every graph
     std::vector<vk::CommandBuffer> cmd_bufs; // in submission order

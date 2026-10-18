@@ -1142,6 +1142,8 @@ vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buff
 //                           in-graph cost, results are wrong while set. QUANTIZE_Q8_1 skips the mat-vec input quantize
 //   GGML_VK_SUBMIT_AT_END=1 diagnostic: record the whole graph before submitting it (pure GPU time in GGML_VK_GPU_SPAN)
 //   GGML_VK_GRAPH_REPLAY=N  recorded graphs kept per context for resubmission (vk_graph_replay), default 8, 0 disables
+//   GGML_VK_REPLAY_UID=0    always compare the full replay key, also for a graph with the uid of the entry's last
+//                           match; 2 compares it anyway and reports a uid match whose key differs
 struct ggml_vk_ab_env {
     std::string              skip_raw;
     std::vector<std::string> skip_ops;
@@ -1154,6 +1156,7 @@ struct ggml_vk_ab_env {
     bool                     fuse_mmv_epi  = true;
     bool                     submit_at_end = false;
     int                      graph_replay  = 0;
+    int                      replay_uid    = 1;
     size_t                   skip_hash     = 0;
 
     // the switches that change how a graph is recorded, part of a replay key
@@ -1197,6 +1200,8 @@ struct ggml_vk_ab_env {
         submit_at_end = se && atoi(se) != 0;
         const char * gr = getenv("GGML_VK_GRAPH_REPLAY");
         graph_replay = gr ? std::max(0, atoi(gr)) : 8;
+        const char * ru = getenv("GGML_VK_REPLAY_UID");
+        replay_uid = ru ? atoi(ru) : 1;
     }
 };
 static ggml_vk_ab_env g_vk_ab;
@@ -14102,6 +14107,9 @@ static uint64_t ggml_vk_diag_every(const char * name) {
 struct ggml_vk_replay_stats {
     uint64_t hits = 0, recorded = 0, kept = 0, busy = 0, pending_reads = 0, no_slot = 0, checks = 0;
     double   check_ms = 0;
+    // replayed graphs per size class: entry -> key check, key check, pending work flush, replay submit
+    uint64_t hit_n[3] = {0, 0, 0}, hit_cbs[3] = {0, 0, 0};
+    double   hit_pre[3] = {0, 0, 0}, hit_key[3] = {0, 0, 0}, hit_flush[3] = {0, 0, 0}, hit_submit[3] = {0, 0, 0};
 };
 static ggml_vk_replay_stats g_vk_replay_stats;
 
@@ -14147,6 +14155,12 @@ struct ggml_vk_cpu_timing {
                         (unsigned long long) r.hits, (unsigned long long) r.recorded, (unsigned long long) r.kept,
                         (unsigned long long) r.busy, (unsigned long long) r.pending_reads, (unsigned long long) r.no_slot,
                         r.check_ms / r.checks);
+                for (int c = 0; c < 3; ++c) {
+                    if (r.hit_n[c] == 0) continue;
+                    const double k = 1.0 / r.hit_n[c];
+                    fprintf(stderr, "vk_graph_replay %s: hits %llu, entry->check %.3f ms, key check %.3f ms, flush pending %.3f ms, replay submit %.3f ms, %.1f command buffers\n",
+                            names[c], (unsigned long long) r.hit_n[c], r.hit_pre[c] * k, r.hit_key[c] * k, r.hit_flush[c] * k, r.hit_submit[c] * k, r.hit_cbs[c] * k);
+                }
                 r = {};
             }
         }
@@ -15290,6 +15304,7 @@ static bool ggml_vk_replay_uses(const ggml_cgraph * cgraph, F && f) {
 }
 
 static void ggml_vk_replay_key(const ggml_cgraph * cgraph, vk_graph_replay & e) {
+    e.uid    = cgraph->uid;
     e.cfg[0] = (uint64_t) cgraph->n_nodes;
     e.cfg[1] = g_vk_ab.cfg_word();
     e.cfg[2] = (uint64_t) g_vk_ab.skip_hash;
@@ -15345,6 +15360,15 @@ static bool ggml_vk_replay_match(const ggml_cgraph * cgraph, const vk_graph_repl
         return k < e.uses.size() && e.uses[k].first == t && e.uses[k++].second == n;
     });
     return same_uses && k == e.uses.size();
+}
+
+// ggml_backend_sched gives a split graph a new uid each time it splits a graph, and the user may only change input
+// data in between (the CUDA graphs rely on the same), so a graph with the uid of an entry's last match is that graph:
+// the full key compare (~0.35 ms for a 4700-node graph on a slow CPU) is skipped
+static bool ggml_vk_replay_uid_match(const ggml_cgraph * cgraph, const vk_graph_replay & e) {
+    return g_vk_ab.replay_uid > 0 && cgraph->uid != 0 && e.uid == cgraph->uid && cgraph->n_nodes > 0 && e.cfg[0] == (uint64_t) cgraph->n_nodes &&
+           e.cfg[1] == g_vk_ab.cfg_word() && e.cfg[2] == (uint64_t) g_vk_ab.skip_hash &&
+           e.nodes.front() == cgraph->nodes[0] && e.nodes.back() == cgraph->nodes[cgraph->n_nodes - 1];
 }
 
 // GGML_VK_REPLAY_WHY=N diagnostic (stderr): why graphs miss the replay entries. Each miss is counted by its first
@@ -15665,15 +15689,39 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const uint64_t epoch = ctx->device->buffer_epoch.load(std::memory_order_relaxed);
         vk_graph_replay * hit = nullptr;
         bool busy = false;
+        vk_graph_replay * found = nullptr;
         for (auto & e : ctx->replays) {
             if (e->valid && e->epoch != epoch) {
                 e->valid = false;
             }
-            if (e->valid && ggml_vk_replay_match(cgraph, *e)) {
-                busy = e->in_flight;
-                hit  = busy ? nullptr : e.get();
+            if (e->valid && ggml_vk_replay_uid_match(cgraph, *e)) {
+                found = e.get();
+                if (g_vk_ab.replay_uid == 2 && !ggml_vk_replay_match(cgraph, *e)) {
+                    static uint64_t n_bad = 0;
+                    if (n_bad++ < 16) {
+                        fprintf(stderr, "vk_graph_replay: graph uid %llu (%d nodes) matches an entry whose key differs\n",
+                                (unsigned long long) cgraph->uid, cgraph->n_nodes);
+                    }
+                    found = nullptr;
+                }
                 break;
             }
+        }
+        if (!found) {
+            for (auto & e : ctx->replays) {
+                if (e->valid && e->epoch != epoch) {
+                    e->valid = false;
+                }
+                if (e->valid && ggml_vk_replay_match(cgraph, *e)) {
+                    found  = e.get();
+                    e->uid = cgraph->uid;
+                    break;
+                }
+            }
+        }
+        if (found) {
+            busy = found->in_flight;
+            hit  = busy ? nullptr : found;
         }
         g_vk_replay_stats.checks++;
         if (!hit && !busy && ggml_vk_replay_why_every() > 0) {
@@ -15686,6 +15734,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // the same graph is still running: record this one the normal way
             g_vk_replay_stats.busy++;
         } else {
+            const int64_t t_f0 = g_vk_cpu_timing.enabled ? ggml_time_us() : 0;
             ggml_vk_submit_transfer_ctx(ctx);
             if (!ggml_vk_replay_flush_pending(ctx)) {
                 g_vk_replay_stats.pending_reads++;
@@ -15693,11 +15742,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ggml_vk_gpu_span_read(ctx);
                 ggml_vk_gpu_span_begin(ctx, cgraph, true);
                 if (hit) {
+                    const int64_t t_s0 = g_vk_cpu_timing.enabled ? ggml_time_us() : 0;
                     ggml_vk_replay_submit(ctx, *hit);
                     g_vk_replay_stats.hits++;
                     if (g_vk_cpu_timing.enabled) {
+                        const int64_t t_s1 = ggml_time_us();
+                        const int cls = ggml_vk_cpu_timing::cls_of(cgraph->n_nodes);
                         g_vk_cpu_timing.first_done = true;
-                        g_vk_cpu_timing.first[ggml_vk_cpu_timing::cls_of(cgraph->n_nodes)] += 1e-3 * (ggml_time_us() - t_cpu_start);
+                        g_vk_cpu_timing.first[cls] += 1e-3 * (t_s1 - t_cpu_start);
+                        ggml_vk_replay_stats & rs = g_vk_replay_stats;
+                        rs.hit_n[cls]++;
+                        rs.hit_cbs[cls]    += hit->cmd_bufs.size();
+                        rs.hit_pre[cls]    += 1e-3 * (t_k0 - t_cpu_start);
+                        rs.hit_key[cls]    += 1e-3 * (t_f0 - t_k0);
+                        rs.hit_flush[cls]  += 1e-3 * (t_s0 - t_f0);
+                        rs.hit_submit[cls] += 1e-3 * (t_s1 - t_s0);
                     }
                     return ggml_vk_graph_compute_finish(ctx, cgraph, t_cpu_start);
                 }
