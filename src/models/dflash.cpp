@@ -418,6 +418,16 @@ static ggml_tensor * build_dflash2_conv(
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
             coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
 
+    // one node instead of ~10 small ones per call; LLAMA_DFLASH_CONV_OP=0 builds it from the basic ops below
+    static const bool use_op = [] {
+        const char * e = getenv("LLAMA_DFLASH_CONV_OP");
+        return !e || atoi(e) != 0;
+    }();
+    if (use_op) {
+        ggml_tensor * base_k = ggml_view_2d(ctx0, base, hidden_size, kernel_size, base->nb[1], side * base->nb[2]);
+        return ggml_dflash_conv(ctx0, hidden, coeffs_side, base_k, (int) block_size);
+    }
+
     ggml_tensor * coeff_all = ggml_cont(ctx0, coeffs_side);
     coeff_all = ggml_reshape_4d(ctx0, coeff_all, 1, n_groups, kernel_size, n_tokens);
     coeff_all = ggml_repeat_4d(ctx0, coeff_all, group_size, n_groups, kernel_size, n_tokens);
