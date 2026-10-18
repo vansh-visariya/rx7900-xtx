@@ -1867,11 +1867,21 @@ void llama_kv_cache::set_input_kq_pos(ggml_tensor * kv_dst, ggml_tensor * q_dst,
 
     const int64_t n_kv = kv_dst->ne[0];
 
+    // the f16 values of all relative positions: the loop runs over every cell of the cache for each batch
+    static const std::vector<ggml_fp16_t> rel_f16 = [] {
+        std::vector<ggml_fp16_t> res(4097);
+        for (int i = 0; i < 4097; ++i) {
+            res[i] = ggml_fp32_to_fp16((float) (i - 2048));
+        }
+        return res;
+    }();
+    const ggml_fp16_t * rel_tab = rel_f16.data() + 2048;
+
     ggml_fp16_t * kv = (ggml_fp16_t *) kv_dst->data;
     for (int64_t j = 0; j < n_kv; ++j) {
         const bool hidden = cells.is_empty(j) || (!single_seq && !cells.seq_has(j, seq_id));
         const llama_pos rel = hidden ? 2048 : std::clamp<llama_pos>(cells.pos_get(j) - p_min, -2048, 2048);
-        kv[j] = ggml_fp32_to_fp16((float) rel);
+        kv[j] = rel_tab[rel];
     }
 
     ggml_fp16_t * q = (ggml_fp16_t *) q_dst->data;
