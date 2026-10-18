@@ -582,6 +582,7 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_GATED_DELTA_NET_REPLAY,
+        GGML_OP_DFLASH_CONV,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2680,6 +2681,19 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * log,
             struct ggml_tensor  * n_replay);
+
+    // DFlash2 block convolution: a depthwise convolution over the previous tokens of the same block, whose weight is a
+    // static part plus a per-token coefficient shared by each group of channels
+    //   x    : [C, T]       T = n_blocks * block_size tokens
+    //   dyn  : [C/G, K, T]  coefficient per group of G channels, tap and token
+    //   base : [C, K]       static weight per channel and tap
+    //   res[c, t] = sum over k < K of (dyn[c/G, k, t] + base[c, k]) * x[c, t - k], with x = 0 before the block of t
+    GGML_API struct ggml_tensor * ggml_dflash_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dyn,
+            struct ggml_tensor  * base,
+            int                   block_size);
 
     // DSA lightning indexer
     //

@@ -4393,6 +4393,34 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+// GGML_OP_DFLASH_CONV, with the coefficients and static weights as views of one side of their tensors (as DFlash2 builds it)
+struct test_dflash_conv : public test_case {
+    const int64_t n_embd;
+    const int64_t group_size;
+    const int64_t kernel_size;
+    const int64_t n_tokens;
+    const int     block_size;
+    const int     side;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, group_size, kernel_size, n_tokens, block_size, side);
+    }
+
+    test_dflash_conv(int64_t n_embd = 5120, int64_t group_size = 16, int64_t kernel_size = 2, int64_t n_tokens = 5,
+            int block_size = 5, int side = 0)
+        : n_embd(n_embd), group_size(group_size), kernel_size(kernel_size), n_tokens(n_tokens), block_size(block_size), side(side) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_groups = n_embd / group_size;
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * dyn  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_groups, kernel_size, 2, n_tokens);
+        ggml_tensor * base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, kernel_size, 2);
+        ggml_tensor * dyn_side  = ggml_view_3d(ctx, dyn, n_groups, kernel_size, n_tokens, dyn->nb[1], dyn->nb[3], side * dyn->nb[2]);
+        ggml_tensor * base_side = ggml_view_2d(ctx, base, n_embd, kernel_size, base->nb[1], side * base->nb[2]);
+        return ggml_dflash_conv(ctx, x, dyn_side, base_side, block_size);
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -10458,6 +10486,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
+    }
+
+    for (int side : {0, 1}) {
+        test_cases.emplace_back(new test_dflash_conv(5120, 16, 2, 5, 5, side));
+        test_cases.emplace_back(new test_dflash_conv(5120, 16, 2, 16, 8, side));
+        test_cases.emplace_back(new test_dflash_conv(1000, 8, 3, 12, 4, side));
     }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally

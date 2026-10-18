@@ -1081,6 +1081,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "GATED_DELTA_NET_REPLAY",
+    "DFLASH_CONV",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1197,6 +1198,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "gated_delta_net_replay(q, k, v, g, beta, s, log, n)",
+    "dflash_conv(x, dyn, base)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1218,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6432,6 +6434,38 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_dflash_conv
+
+struct ggml_tensor * ggml_dflash_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dyn,
+        struct ggml_tensor  * base,
+        int                   block_size) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dyn->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && dyn->nb[0] == sizeof(float) && base->nb[0] == sizeof(float));
+
+    const int64_t C = x->ne[0];
+    const int64_t T = x->ne[1];
+    const int64_t K = base->ne[1];
+
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(base->ne[0] == C && base->ne[2] == 1 && base->ne[3] == 1);
+    GGML_ASSERT(dyn->ne[0] > 0 && C % dyn->ne[0] == 0 && dyn->ne[1] == K && dyn->ne[2] == T && dyn->ne[3] == 1);
+    GGML_ASSERT(block_size > 0 && T % block_size == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+
+    ggml_set_op_params_i32(result, 0, block_size);
+
+    result->op     = GGML_OP_DFLASH_CONV;
+    result->src[0] = x;
+    result->src[1] = dyn;
+    result->src[2] = base;
 
     return result;
 }

@@ -11104,6 +11104,54 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_dflash_conv
+
+static void ggml_compute_forward_dflash_conv_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * dyn  = dst->src[1];
+    const ggml_tensor * base = dst->src[2];
+
+    const int64_t C = x->ne[0];
+    const int64_t T = x->ne[1];
+    const int64_t K = base->ne[1];
+    const int64_t G = C / dyn->ne[0];
+    const int64_t B = ggml_get_op_params_i32(dst, 0);
+
+    // threads split the channels
+    const int64_t dc = (C + params->nth - 1) / params->nth;
+    const int64_t c0 = dc * params->ith;
+    const int64_t c1 = MIN(c0 + dc, C);
+
+    for (int64_t t = 0; t < T; ++t) {
+        float * res = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t c = c0; c < c1; ++c) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                const float d = *(const float *) ((const char *) dyn->data + (c/G)*dyn->nb[0] + k*dyn->nb[1] + t*dyn->nb[2]);
+                const float b = *(const float *) ((const char *) base->data + c*base->nb[0] + k*base->nb[1]);
+                const float v = t % B >= k ? *(const float *) ((const char *) x->data + c*x->nb[0] + (t - k)*x->nb[1]) : 0.0f;
+                const float w = d + b;
+                const float term = w * v;
+                acc = k == 0 ? term : acc + term;
+            }
+            res[c] = acc;
+        }
+    }
+}
+
+void ggml_compute_forward_dflash_conv(const ggml_compute_params * params, ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_dflash_conv_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_gated_delta_net_replay
 static void ggml_compute_forward_gated_delta_net_replay_one_chunk(
     const ggml_compute_params * params,
