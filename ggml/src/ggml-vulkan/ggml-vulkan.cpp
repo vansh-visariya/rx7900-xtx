@@ -3689,6 +3689,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dflash_conv_f32, "dflash_conv_f32", dflash_conv_f32_len, dflash_conv_f32_data, "main", 4, sizeof(vk_op_dflash_conv_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_state_f32,     "ssm_conv_state_f32",     ssm_conv_state_f32_len, ssm_conv_state_f32_data, "main", 6, sizeof(vk_op_ssm_conv_state_push_constants), {64, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -10381,6 +10382,30 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     });
 }
 
+static void ggml_vk_dflash_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * dyn, const ggml_tensor * base, ggml_tensor * dst) {
+    vk_pipeline pipeline = ctx->device->pipeline_dflash_conv_f32;
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer x_buf    = ggml_vk_tensor_subbuffer(ctx, x,    true);
+    const vk_subbuffer dyn_buf  = ggml_vk_tensor_subbuffer(ctx, dyn,  true);
+    const vk_subbuffer base_buf = ggml_vk_tensor_subbuffer(ctx, base, true);
+    const vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst,  true);
+
+    vk_op_dflash_conv_push_constants pc = {
+        (uint32_t) x->ne[0], (uint32_t) x->ne[1], (uint32_t) base->ne[1], (uint32_t) (x->ne[0] / dyn->ne[0]),
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        ggml_vk_nb_elem(x, 1),
+        ggml_vk_nb_elem(dyn, 1), ggml_vk_nb_elem(dyn, 2),
+        ggml_vk_nb_elem(base, 1),
+        ggml_vk_nb_elem(dst, 1),
+        0, 0, 0, 0,
+    };
+    init_pushconst_tensor_offsets(ctx, pc, x, dyn, base, nullptr, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, dyn_buf, base_buf, dst_buf }, pc, { (uint32_t) x->ne[0], (uint32_t) x->ne[1], 1 });
+}
+
 static void ggml_vk_ssm_conv_state(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_conv_state_fusion & f) {
     const ggml_tensor * cache = f.rows->src[0];
     const ggml_tensor * idx   = f.rows->src[1];
@@ -13294,6 +13319,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_SSM_CONV:
         ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+
+        break;
+
+    case GGML_OP_DFLASH_CONV:
+        ggml_vk_dflash_conv(ctx, compute_ctx, src0, src1, src2, node);
 
         break;
 
@@ -17644,6 +17674,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_DFLASH_CONV:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:

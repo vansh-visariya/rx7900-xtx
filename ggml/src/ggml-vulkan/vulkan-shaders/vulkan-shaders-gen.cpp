@@ -1230,6 +1230,7 @@ void process_shaders() {
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_conv_state_f32", "ssm_conv_state.comp", {});
+    string_to_spv("dflash_conv_f32", "dflash_conv.comp", {});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 

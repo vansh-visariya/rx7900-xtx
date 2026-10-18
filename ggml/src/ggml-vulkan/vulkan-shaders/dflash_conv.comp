@@ -1,0 +1,48 @@
+#version 450
+
+// DFlash2 block convolution (ggml_dflash_conv): one invocation per channel and token,
+// res[c, t] = sum over k < K of (dyn[c/G, k, t] + base[c, k]) * x[c, t - k], x = 0 before the block of t.
+// The products and the sum are precise, so they round like the separate add, mul and add nodes.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint C; uint T; uint K; uint G; uint B;
+
+    uint nbx1;              // x
+    uint nbd1; uint nbd2;   // dyn
+    uint nbb1;              // base
+    uint nbo1;              // dst
+
+    uint x_offset;
+    uint d_offset;
+    uint b_offset;
+    uint o_offset;
+};
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer D { float data_d[]; };
+layout(binding = 2, std430) readonly buffer W { float data_b[]; };
+layout(binding = 3, std430) writeonly buffer O { float data_o[]; };
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+
+    if (c >= C) {
+        return;
+    }
+
+    const uint tb = t % B;
+
+    precise float acc = 0.0;
+    for (uint k = 0; k < K; ++k) {
+        const float w = data_d[d_offset + c / G + k * nbd1 + t * nbd2] + data_b[b_offset + c + k * nbb1];
+        const float v = tb >= k ? data_x[x_offset + c + (t - k) * nbx1] : 0.0;
+        precise float term = w * v;
+        acc = k == 0 ? term : acc + term;
+    }
+
+    data_o[o_offset + c + t * nbo1] = acc;
+}
