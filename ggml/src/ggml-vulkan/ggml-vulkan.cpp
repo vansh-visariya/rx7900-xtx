@@ -15896,6 +15896,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    uint32_t nodes_per_submit = ctx->device->max_nodes_per_submit;
+    if (replay) {
+        // the batches of a recorded graph become the command buffers of every resubmission (~4 us of vkQueueSubmit
+        // each on RADV), while early submits help only this first run: few large batches, sized by this graph and not
+        // by the previous one (a context that alternates a small and a large graph split the large one after every
+        // heavy node)
+        uint64_t graph_flops = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            graph_flops += ggml_vk_get_node_flops(cgraph->nodes[i]);
+        }
+        flops_per_submit = std::min(flops_cap, graph_flops / 8u);
+        nodes_per_submit = 4 * ctx->device->max_nodes_per_submit;
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -16239,7 +16252,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             return e ? (uint32_t) std::max(0, atoi(e)) : 12u;
         }();
         bool submit = (first_submit_nodes > 0 && submit_count == 0 && submitted_nodes + 1 >= first_submit_nodes) ||
-                      (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+                      (submitted_nodes >= nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
