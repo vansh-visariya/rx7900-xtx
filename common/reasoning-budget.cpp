@@ -308,3 +308,16 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
 
     return true;
 }
+
+llama_token common_reasoning_budget_get_forced(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+    if (ctx->state != REASONING_BUDGET_FORCING || ctx->force_pos >= ctx->forced_tokens.size()) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    return ctx->forced_tokens[ctx->force_pos];
+}

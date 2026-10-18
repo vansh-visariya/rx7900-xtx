@@ -15,6 +15,9 @@ struct llama_sampler_chain {
     // has .backend_init() been called?
     bool is_init = false;
 
+    // detached and released (llama_sampler_chain_backend_release): CPU only from now on
+    bool is_released = false;
+
     uint32_t n_nodes = 0;
 
     struct info {

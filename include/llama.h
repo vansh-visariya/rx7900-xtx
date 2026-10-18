@@ -1465,6 +1465,16 @@ extern "C" {
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
 
+    /// @details True if smpl is a lazy grammar sampler that has not met its trigger yet: until then it accepts every
+    ///          token and leaves the candidates unchanged. False for any other sampler and for NULL.
+    LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);
+
+    /// @details For a sampler chain that was attached to a context with llama_set_sampler() and has been detached
+    ///          (llama_set_sampler with NULL): forget the backend part, so that applying the chain runs all of its
+    ///          samplers on the CPU again (an attached chain skips the samplers the backend ran). A released chain
+    ///          must not be attached again. No-op for other samplers.
+    LLAMA_API void llama_sampler_chain_backend_release(struct llama_sampler * chain);
+
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(

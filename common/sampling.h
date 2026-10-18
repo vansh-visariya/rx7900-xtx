@@ -111,8 +111,17 @@ llama_token common_spec_rejection_step(const llama_token_data_array & cur_p, lla
         const std::vector<llama_token_data> & q, std::mt19937 & rng, bool & accepted);
 
 // true if the sampler chain yields an explicit distribution p that can be used for rejection sampling
-// (temp > 0, no grammar, no mirostat/xtc/adaptive-p, no backend sampling)
+// (temp > 0, no grammar constraining the tokens, no mirostat/xtc/adaptive-p)
 bool common_sampler_supports_rejection(const struct common_sampler * gsmpl);
+
+// true if backend sampling was requested and can be used for the next decode: no grammar constrains the tokens
+// (a lazy grammar does not until its trigger). Callers that attach the backend sampler re-check it before each
+// decode; a verification stops at the token where a grammar starts constraining.
+bool common_sampler_backend_ok(const struct common_sampler * gsmpl);
+
+// after detaching the backend sampler (llama_set_sampler with NULL): the chain runs on the CPU for the rest of the
+// request and common_sampler_backend_ok() stays false (a chain cannot be attached twice)
+void common_sampler_backend_release(struct common_sampler * gsmpl);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

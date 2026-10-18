@@ -398,6 +398,7 @@ struct server_slot {
         n_predict_max = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        backend_sampler_on = false;
 
         // clear alora start
         alora_invocation_start = -1;
@@ -501,12 +502,27 @@ struct server_slot {
         return n_draft_max;
     }
 
+    // a backend sampler is attached to this slot's sequence
+    bool backend_sampler_on = false;
+
+    // the backend sampler stays attached while no grammar constrains the tokens (a lazy grammar until its trigger);
+    // from then on the request samples on the CPU
+    void update_backend_sampler() {
+        if (backend_sampler_on && !common_sampler_backend_ok(smpl.get())) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+            common_sampler_backend_release(smpl.get());
+            backend_sampler_on = false;
+        }
+    }
+
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     // accepted tokens of the last speculative cycle that are not yet streamed: they are
     // processed while the GPU runs the next draft
     std::vector<llama_token> spec_pending;
 
     void handle_last_sampled_token(server_batch & batch) {
+        update_backend_sampler();
+
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding
@@ -1794,17 +1810,14 @@ private:
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
-
             // TODO: getting pre sampling logits is not yet supported with backend sampling
-            use_backend_sampling &= !need_pre_sample_logits;
+            // common_sampler_backend_ok() keeps the request's backend_sampling (the sampler init clears it in the
+            // params when a grammar is set): a lazy grammar samples on the backend until its trigger, then
+            // handle_last_sampled_token() detaches the backend sampler for the rest of the request
+            slot.backend_sampler_on = !need_pre_sample_logits && common_sampler_backend_ok(slot.smpl.get());
 
-            // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
-            } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
-            }
+            // always (re)set: the previous request's chain is gone
+            llama_set_sampler(ctx_tgt, slot.id, slot.backend_sampler_on ? common_sampler_get(slot.smpl.get()) : nullptr);
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());

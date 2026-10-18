@@ -128,6 +128,9 @@ struct common_sampler {
 
     std::mt19937 rng_spec; // rejection-sampling verification draws
 
+    // backend sampling was requested: usable while no grammar constrains the tokens (common_sampler_backend_ok)
+    bool backend_wanted = false;
+
     void reset() {
         prev.clear();
 
@@ -419,14 +422,16 @@ struct common_sampler * common_sampler_init(
         llama_sampler_chain_add(chain, smpl);
     }
 
+    // a grammar that constrains the tokens needs the full logits on the host. A lazy grammar constrains nothing
+    // until its trigger: callers that re-check common_sampler_backend_ok() before each decode (the server) can
+    // sample on the backend until then. The reasoning budget only forces tokens, which common_sampler_sample
+    // applies on top of a backend-sampled token, so it keeps backend sampling.
+    const bool backend_wanted = params.backend_sampling;
+
     if (grmr && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
+        if (!params.grammar_lazy) {
+            LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
+        }
 
         params.backend_sampling = false;
     }
@@ -440,6 +445,7 @@ struct common_sampler * common_sampler_init(
         /* .cur     = */ {},
         /* .cur_p   = */ {},
         /* .rng_spec = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .backend_wanted = */ backend_wanted,
     };
 
     return result;
@@ -457,7 +463,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
-static bool grammar_should_apply(struct common_sampler * gsmpl) {
+static bool grammar_should_apply(const struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;
     }
@@ -470,6 +476,11 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
     return true;
+}
+
+// the grammar (if any) constrains the next token; a lazy grammar does not before its trigger
+static bool grammar_constrains(const struct common_sampler * gsmpl) {
+    return grammar_should_apply(gsmpl) && !llama_sampler_grammar_awaiting_trigger(gsmpl->grmr);
 }
 
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
@@ -524,6 +535,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng_spec = */ gsmpl->rng_spec,
+        /* .backend_wanted = */ gsmpl->backend_wanted,
     };
 }
 
@@ -546,6 +558,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us = src->t_total_us;
     dst->rng_spec   = src->rng_spec;
+    dst->backend_wanted = src->backend_wanted;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -624,8 +637,18 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            // a grammar that constrains the tokens needs the full logits: callers switch backend sampling off while
+            // one does (common_sampler_backend_ok); a lazy grammar before its trigger leaves the candidates as they are
+            GGML_ASSERT(!grammar_constrains(gsmpl) && "using grammar in combination with backend sampling is not supported");
+
+            // the reasoning budget forces its end sequence: p is all on the forced token
+            const llama_token forced = common_reasoning_budget_get_forced(rbudget);
+            if (forced != LLAMA_TOKEN_NULL) {
+                gsmpl->cur.assign(1, llama_token_data{ forced, 0.0f, 1.0f });
+                cur_p = { gsmpl->cur.data(), 1, 0, true };
+
+                return forced;
+            }
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
@@ -706,6 +729,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         result.push_back(id);
 
         if (draft[i] != id) {
+            break;
+        }
+
+        // a grammar starts constraining after this token (a lazy grammar's trigger), but the later positions were
+        // sampled on the backend without it: stop here, this token becomes the last sampled one
+        if (grammar_constrains(gsmpl) && llama_get_sampled_token_ith(ctx, idxs[i]) != LLAMA_TOKEN_NULL) {
             break;
         }
     }
@@ -796,12 +825,26 @@ bool common_sampler_supports_rejection(const struct common_sampler * gsmpl) {
     const auto & params = gsmpl->params;
 
     // backend sampling is fine: the backend chain exports the post-chain candidate probs, which is
-    // the p the rejection step needs (the backend-sampled token is only the degenerate-p fallback)
-    return gsmpl->grmr == nullptr &&
+    // the p the rejection step needs (the backend-sampled token is only the degenerate-p fallback).
+    // A lazy grammar before its trigger leaves p as it is; the verification stops where it starts.
+    return !grammar_constrains(gsmpl) &&
         params.temp > 0.0f &&
         params.mirostat == 0 &&
         params.xtc_probability <= 0.0f &&
         params.adaptive_target < 0.0f;
+}
+
+bool common_sampler_backend_ok(const struct common_sampler * gsmpl) {
+    return gsmpl && gsmpl->backend_wanted && !grammar_constrains(gsmpl);
+}
+
+void common_sampler_backend_release(struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return;
+    }
+
+    llama_sampler_chain_backend_release(gsmpl->chain);
+    gsmpl->backend_wanted = false;
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
@@ -816,7 +859,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
-    for (size_t i = 0; i < draft.size(); i++) {
+    // a grammar that starts constraining within the batch (a lazy grammar's trigger) ends the verification at that
+    // token: p at the later positions depends on the grammar, and backend-sampled positions have no logits for it
+    bool grammar_started = false;
+
+    for (size_t i = 0; i < draft.size() && !grammar_started; i++) {
         const llama_token x = draft[i];
 
         if (is_replay) {
@@ -837,6 +884,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
         if (accepted) {
             common_sampler_accept(gsmpl, x, true);
             result.push_back(x);
+            grammar_started = grammar_constrains(gsmpl);
             continue;
         }
 
@@ -850,12 +898,18 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
         return result;
     }
 
-    // all drafts accepted: the bonus token is sampled from p
-    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[draft.size()], false);
+    // all drafts accepted: the bonus token is sampled from p (a replayed prefix can end on a grammar trigger; with
+    // backend sampling that position has no logits to apply the grammar to, so the prefix ends the batch instead)
+    const bool bonus_ok = !grammar_started &&
+        !(is_replay && grammar_constrains(gsmpl) && llama_get_sampled_token_ith(ctx, idxs[draft.size()]) != LLAMA_TOKEN_NULL);
 
-    common_sampler_accept(gsmpl, id, true);
+    if (bonus_ok) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[draft.size()], false);
 
-    result.push_back(id);
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
 
     if (common_spec_stats_enabled()) {
         spec_stats_record_verify(gsmpl, ctx, idxs, draft, result, &draft_q);

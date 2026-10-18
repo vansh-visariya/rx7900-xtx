@@ -737,6 +737,7 @@ static bool llama_sampler_chain_backend_init(
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
     GGML_ASSERT(chain->is_init == false && "llama_sampler_chain_backend_init() called twice");
+    GGML_ASSERT(chain->is_released == false && "a released sampler chain cannot be attached again");
 
     chain->is_init = true;
 
@@ -873,6 +874,7 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
         /* .ctx   = */ new llama_sampler_chain {
             /* .params               = */ params,
             /* .is_init              = */ false,
+            /* .is_released          = */ false,
             /* .n_nodes              = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},
@@ -991,6 +993,22 @@ struct llama_sampler * llama_sampler_chain_get(struct llama_sampler * chain, int
     }
 
     return p->samplers[i].ptr;
+}
+
+void llama_sampler_chain_backend_release(struct llama_sampler * chain) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return;
+    }
+
+    auto * p = (llama_sampler_chain *) chain->ctx;
+
+    // the per-sampler backend state stays initialized (they assert against a second init), hence no re-attach
+    p->is_init     = false;
+    p->is_released = true;
+
+    for (auto & smpl : p->samplers) {
+        smpl.is_backend = false;
+    }
 }
 
 struct llama_sampler * llama_sampler_chain_remove(struct llama_sampler * chain, int32_t i) {
@@ -2849,6 +2867,16 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens) {
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, nullptr, 0, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
+}
+
+bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_grammar_i) {
+        return false;
+    }
+
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+
+    return ctx->grammar != nullptr && ctx->grammar->awaiting_trigger;
 }
 
 // penalties
