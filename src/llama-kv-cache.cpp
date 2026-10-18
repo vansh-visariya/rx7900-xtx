@@ -360,6 +360,35 @@ llama_kv_cache::llama_kv_cache(
 
             ggml_gen_hadamard(tmp);
         }
+
+        if (!hparams.no_alloc && ctxs_bufs.size() == 1) {
+            ggml_init_params params = {
+                /* .mem_size   = */ 2*ggml_tensor_overhead(),
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+            ctx_rot.reset(ggml_init(params));
+            if (attn_rot_k) {
+                rot_k = ggml_new_tensor_2d(ctx_rot.get(), GGML_TYPE_F32, n_rot_k(), n_rot_k());
+                ggml_set_name(rot_k, "attn_rot_k");
+            }
+            if (attn_rot_v) {
+                rot_v = ggml_new_tensor_2d(ctx_rot.get(), GGML_TYPE_F32, n_rot_v(), n_rot_v());
+                ggml_set_name(rot_v, "attn_rot_v");
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctxs_bufs[0].second.get());
+            buf_rot.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_rot.get(), buft));
+            if (buf_rot) {
+                for (ggml_tensor * t : { rot_k, rot_v }) {
+                    if (t) {
+                        ggml_backend_tensor_set(t, attn_rot_hadamard.at(t->ne[0]).data(), 0, ggml_nbytes(t));
+                    }
+                }
+            } else {
+                rot_k = nullptr;
+                rot_v = nullptr;
+            }
+        }
     }
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
@@ -1441,18 +1470,40 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
+int64_t llama_kv_cache::n_rot_k() const {
+    int64_t nrot = 64;
+
+    // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+    // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+    do {
+        nrot *= 2;
+    } while (n_embd_head_k_all % nrot == 0);
+    nrot /= 2;
+
+    return nrot;
+}
+
+int64_t llama_kv_cache::n_rot_v() const {
+    int64_t nrot = 64;
+    // using smaller rotation matrices for V seems beneficial
+    // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
+    //do {
+    //    nrot *= 2;
+    //} while (hparams.n_embd_head_v() % nrot == 0);
+    //nrot /= 2;
+
+    return nrot;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        int nrot = 64;
+        if (rot_k) {
+            return rot_k;
+        }
 
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
+        const int64_t nrot = n_rot_k();
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -1466,13 +1517,11 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_v) {
-        int nrot = 64;
-        // using smaller rotation matrices for V seems beneficial
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
-        //do {
-        //    nrot *= 2;
-        //} while (hparams.n_embd_head_v() % nrot == 0);
-        //nrot /= 2;
+        if (rot_v) {
+            return rot_v;
+        }
+
+        const int64_t nrot = n_rot_v();
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -1857,6 +1906,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (dst == rot_k) {
+        return;
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -1866,6 +1918,9 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    if (dst == rot_v) {
+        return;
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];

@@ -286,6 +286,16 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // device copies of the K and V rotation matrices, when the whole cache is in one buffer type; the graphs read them
+    // in place instead of uploading them as inputs every time
+    ggml_context_ptr        ctx_rot;
+    ggml_backend_buffer_ptr buf_rot;
+    ggml_tensor *           rot_k = nullptr;
+    ggml_tensor *           rot_v = nullptr;
+
+    int64_t n_rot_k() const;
+    int64_t n_rot_v() const;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
