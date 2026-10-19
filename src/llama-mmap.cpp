@@ -279,6 +279,10 @@ struct llama_file::impl {
                 throw std::runtime_error("unexpectedly reached end of file");
             }
         } else {
+            if (dio_bounce) {
+                read_bounced(ptr, len);
+                return;
+            }
             size_t bytes_read = 0;
             while (bytes_read < len) {
                 const size_t to_read = len - bytes_read;
@@ -287,6 +291,15 @@ struct llama_file::impl {
                 if (ret == -1) {
                     if (errno == EINTR) {
                         continue;  // Interrupted by signal, retry
+                    }
+                    // the destination cannot take DMA (pinned memory a GPU driver mapped, e.g. the upload staging
+                    // buffers): keep the direct reads and copy through an aligned host buffer. Falling back to
+                    // buffered IO would stream the whole file through the page cache
+                    if (errno == EFAULT && alignment > 1 && bytes_read % alignment == 0) {
+                        LLAMA_LOG_WARN("%s: destination does not take direct IO (%s), reading through a bounce buffer\n", __func__, strerror(errno));
+                        dio_bounce = true;
+                        read_bounced(reinterpret_cast<char *>(ptr) + bytes_read, len - bytes_read);
+                        return;
                     }
                     // Fallback to std::fread in case the DMA controller cannot access the buffer
                     if (errno == EFAULT || errno == EINVAL) {
@@ -314,6 +327,44 @@ struct llama_file::impl {
 
                 bytes_read += (size_t) ret;
             }
+        }
+    }
+
+    // direct reads of an aligned range into an aligned host buffer, copied to ptr (destinations that cannot take DMA)
+    void read_bounced(void * ptr, size_t len) {
+        constexpr size_t chunk = 64 * 1024 * 1024;
+        if (!bounce) {
+            void * p = nullptr;
+            if (posix_memalign(&p, alignment, chunk) != 0) {
+                throw std::runtime_error("posix_memalign failed for the direct IO bounce buffer");
+            }
+            bounce.reset(static_cast<char *>(p));
+        }
+        size_t done = 0;
+        while (done < len) {
+            const size_t n = std::min(chunk, len - done);
+            size_t got = 0;
+            while (got < n) {
+                ssize_t ret = ::read(fd, bounce.get() + got, n - got);
+                if (ret == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    throw std::runtime_error(format("read error: %s", strerror(errno)));
+                }
+                if (ret == 0) {
+                    // EOF: allow if only alignment padding past the end of the file is missing
+                    off_t pos = lseek(fd, 0, SEEK_CUR);
+                    if (pos != -1 && (size_t) pos == size) {
+                        std::memset(bounce.get() + got, 0, n - got);
+                        break;
+                    }
+                    throw std::runtime_error("unexpectedly reached end of file");
+                }
+                got += (size_t) ret;
+            }
+            std::memcpy(static_cast<char *>(ptr) + done, bounce.get(), n);
+            done += n;
         }
     }
 
@@ -383,6 +434,10 @@ struct llama_file::impl {
     }
     int fd = -1;
     std::string fname;
+
+    // direct IO into destinations that cannot take DMA goes through this buffer (read_bounced)
+    bool dio_bounce = false;
+    std::unique_ptr<char, decltype(&free)> bounce{nullptr, &free};
 #endif
 
     size_t read_alignment() const {
