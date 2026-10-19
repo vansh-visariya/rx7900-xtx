@@ -432,6 +432,8 @@ enum FaCodePath {
     FA_COOPMAT2,
     // coopmat1 for small grouped-query batches, output kept in accumulators (flash_attn_cm1_gqa.comp)
     FA_COOPMAT1_GQA,
+    // coopmat1 for grouped-query prompt batches, 64 query rows per workgroup (flash_attn_cm1_gqa_pp.comp)
+    FA_COOPMAT1_GQA_PP,
 };
 
 struct vk_fa_pipeline_state {

@@ -733,6 +733,10 @@ void process_shaders() {
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
                 string_to_spv("flash_attn_f32_f16_gqa", "flash_attn_cm1_gqa.comp",
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                if (!f16acc) {
+                    string_to_spv("flash_attn_f32_f16_gqa_pp", "flash_attn_cm1_gqa_pp.comp",
+                        merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                }
 #endif
             }
 

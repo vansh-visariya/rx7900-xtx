@@ -2112,6 +2112,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     true, fa.first.subgroup_size);
         }
+        for (auto &fa : device->pipeline_flash_attn_f32_f16) {
+            if (fa.first.path != FA_COOPMAT1_GQA_PP) continue;
+            const uint32_t Br = fa.first.Br;
+            const uint32_t Bc = fa.first.Bc;
+            const bool aligned = fa.first.aligned;
+            ggml_vk_create_pipeline(device, fa.second, aligned ? "flash_attn_f32_f16_aligned_gqa_pp_cm1" : "flash_attn_f32_f16_gqa_pp_cm1",
+                                    flash_attn_f32_f16_gqa_pp_cm1_len, flash_attn_f32_f16_gqa_pp_cm1_data, "main", 8,
+                                    sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
+                                    get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
+                                    true, fa.first.subgroup_size);
+        }
     }
 #endif
 
@@ -8003,6 +8014,19 @@ static bool ggml_vk_flash_attn_gqa_shmem_support(const vk_device& device, uint32
     return total_size <= device->properties.limits.maxComputeSharedMemorySize;
 }
 
+// Needs to be kept up to date with flash_attn_cm1_gqa_pp.comp (Br 64, Bc 32, HSK = HSV = 256, 8 subgroups of 32)
+static bool ggml_vk_flash_attn_gqa_pp_shmem_support(const vk_device& device) {
+    const uint32_t ksh  = 32 * (256 / 4 + 2) * 8;
+    const uint32_t vsh  = 256 * (32 / 4 + 1) * 8;
+    const uint32_t xsh  = 8 * 2 * 2 * 32 * 16;
+    const uint32_t msh  = 2 * 64 * (32 / 8 + 1) * 16;
+    const uint32_t flag = 2 * 8 * 4;
+    const uint32_t iq_shmem = 16 * sizeof(ggml_fp16_t);
+
+    const uint32_t total_size = ksh + vsh + xsh + msh + flag + iq_shmem;
+    return total_size <= device->properties.limits.maxComputeSharedMemorySize;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -8211,6 +8235,25 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    // prompt batches of a GQA group with 32-wide subgroups: 64 rows (tokens x heads of the group) per workgroup, softmax
+    // in registers (flash_attn_cm1_gqa_pp.comp): 7900 XTX, q8_0 KV at 16K / 64K, 512 tokens 1.26x / 1.33x, 64 tokens
+    // 1.78x / 2.04x. GGML_VK_FA_GQA_PP=0 disables it
+    static const bool gqa_pp_enabled = [] { const char * e = getenv("GGML_VK_FA_GQA_PP"); return !e || atoi(e) != 0; }();
+    if (gqa_pp_enabled && tuning_params.path == FA_COOPMAT1_GQA && gqa_sgs == 32 && f32acc && neq1 >= 32 &&
+        HSK == 256 && HSV == 256 && k_type_eff == GGML_TYPE_Q8_0 && v_type_eff == GGML_TYPE_Q8_0 &&
+        nbk1 % 4 == 0 && nbk2 % 4 == 0 && nbk3 % 4 == 0 && nbv1 % 4 == 0 && nbv2 % 4 == 0 && nbv3 % 4 == 0 &&
+        ggml_vk_flash_attn_gqa_pp_shmem_support(ctx->device)) {
+        tuning_params.path           = FA_COOPMAT1_GQA_PP;
+        tuning_params.block_rows     = 64;
+        tuning_params.block_cols     = 32;
+        tuning_params.row_split      = 8;
+        tuning_params.d_split        = 1;
+        tuning_params.subgroup_size  = 32;
+        tuning_params.workgroup_size = 256;
+        N = 64;
+        workgroups_x = CEIL_DIV((uint32_t) neq1 * gqa_ratio, 64u);
+    }
+
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
     uint32_t v_stride = (uint32_t)(nbv1 / ggml_type_size(v->type));
@@ -8244,7 +8287,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && !use_sparse && tuning_params.path != FA_COOPMAT1_GQA && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = mask && !use_sparse && tuning_params.path != FA_COOPMAT1_GQA && tuning_params.path != FA_COOPMAT1_GQA_PP && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
@@ -8309,6 +8352,22 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             // several rounds of workgroups (prompt batches): split the KV range so that the rounds come out nearly
             // full; each extra split costs a little (partial outputs and the reduce pass). The 27B's 512-token batch
             // is 412 workgroups on 96 CUs: 3 splits fill 99% of 13 rounds instead of 86% of 5
+            double best = 0.0;
+            for (uint32_t s = 1; s <= 4 && KV >= s * 4 * tuning_params.block_cols; ++s) {
+                const uint32_t n = wgs * s;
+                const double eff = (double) n / (CEIL_DIV(n, shader_core_count) * shader_core_count) - 0.01 * (s - 1);
+                if (eff > best + 1e-9) {
+                    best = eff;
+                    split_k = s;
+                }
+            }
+        }
+    } else if (tuning_params.path == FA_COOPMAT1_GQA_PP) {
+        // one workgroup per CU: fill one round, or split so that the rounds come out nearly full
+        const uint32_t wgs = workgroups_x * workgroups_y * workgroups_z;
+        if (wgs <= shader_core_count) {
+            split_k = shader_core_count / wgs;
+        } else {
             double best = 0.0;
             for (uint32_t s = 1; s <= 4 && KV >= s * 4 * tuning_params.block_cols; ++s) {
                 const uint32_t n = wgs * s;
