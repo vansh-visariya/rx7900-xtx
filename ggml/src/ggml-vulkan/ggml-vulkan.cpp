@@ -1484,7 +1484,8 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
     };
 }
 
-static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
+// nbuf: tile buffers (2 for the double-buffered coopmat quant matmul, mul_mm.comp MM_NBUF)
+static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type, uint32_t nbuf = 1) {
 
     uint32_t lut_size = 0;
     switch (src0_type) {
@@ -1530,7 +1531,7 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t warps = warptile[0] / warptile[10];
 
-    const uint32_t load_bufs = (warptile[1] + warptile[2]) * (warptile[3] + bank_conflict_offset) * type_size;
+    const uint32_t load_bufs = nbuf * (warptile[1] + warptile[2]) * (warptile[3] + bank_conflict_offset) * type_size;
     const uint32_t mmid_row_ids = mul_mat_id ? (warptile[2] * 2 * sizeof(uint16_t)) : 0;
     const uint32_t coopmat_stage = device->coopmat_support ? warptile[7] * warptile[8] / warps * sizeof(float) : 0;
     const uint32_t ballots_sh = mul_mat_id ? (warps * 4 * sizeof(uint32_t)) : 0;
@@ -2162,23 +2163,36 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 #endif
 
-    auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
+    auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned, uint32_t nbuf = 1) {
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
         if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
             device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
             spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
             spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
+        } else if (nbuf > 1) {
+            spec.push_back(4u);  // constantID=12: SHMEM_STRIDE_PAD (default)
+            spec.push_back(0u);  // constantID=13: APPLY_SLM_A_RESHAPE (default)
+        }
+        if (nbuf > 1) {
+            spec.push_back(0u);    // constantID=14: unused
+            spec.push_back(nbuf);  // constantID=15: MM_NBUF
         }
         return spec;
     };
 
-    auto const &ggml_vk_mul_mm_spec_quant = [&device](std::vector<uint32_t> spec, bool aligned, uint32_t type) {
+    auto const &ggml_vk_mul_mm_spec_quant = [&device](std::vector<uint32_t> spec, bool aligned, uint32_t type, uint32_t nbuf = 1) {
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
         spec.push_back(type);               // constantID=12: MmTypeA
         if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
             device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
             spec.push_back(0u);  // constantID=13: SHMEM_STRIDE_PAD = 0
             spec.push_back(1u);  // constantID=14: APPLY_SLM_A_RESHAPE = true
+        } else if (nbuf > 1) {
+            spec.push_back(4u);  // constantID=13: SHMEM_STRIDE_PAD (default)
+            spec.push_back(0u);  // constantID=14: APPLY_SLM_A_RESHAPE (default)
+        }
+        if (nbuf > 1) {
+            spec.push_back(nbuf);  // constantID=15: MM_NBUF
         }
         return spec;
     };
@@ -2393,8 +2407,6 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif  // defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat_support) {
-        spec_fn_t cm1_spec = [&](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec(wt, a); };
-
         // Intel coopmat1 pins each pipeline's required subgroup size to its warptile WARP element.
         const bool cm1_pin = device->vendor_id == VK_VENDOR_ID_INTEL;
 
@@ -2404,14 +2416,28 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             tc_mmq_id[2] = { { 512, 128, 128, 32, 32, 32, 2, device->coopmat_m, device->coopmat_n, device->coopmat_k, 32 }, { 128, 128, 1 }, 32 };
         }
 
+        // Quant matmuls with f32 accumulators on AMD: the 512-thread tile (prompt batches) keeps two K blocks in shared
+        // memory when they fit, so the next block's loads overlap the multiplications (mul_mm.comp MM_NBUF): 7900 XTX,
+        // 512 columns, iq3_s / iq3_xxs / iq4_xs / q4_K +7..11%. GGML_VK_MM_DBUF=0 disables it
+        static const bool mm_dbuf = [] { const char * e = getenv("GGML_VK_MM_DBUF"); return !e || atoi(e) != 0; }();
+        auto mm_nbuf = [&](const std::vector<uint32_t>& wt, const vk_matmul_pipeline_key& key) -> uint32_t {
+            const bool quant = key.type_a != GGML_TYPE_F32 && key.type_a != GGML_TYPE_F16 && key.type_a != GGML_TYPE_BF16;
+            if (!mm_dbuf || !quant || key.f16acc || key.mul_mat_id || device->vendor_id != VK_VENDOR_ID_AMD ||
+                device->driver_id == vk::DriverId::eAmdProprietary || wt[0] != 512) {
+                return 1;
+            }
+            return ggml_vk_matmul_shmem_support(device, wt, false, key.type_a, 2) ? 2 : 1;
+        };
+
         auto cm1_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                               const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
+            spec_fn_t sp = [&, key](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec(wt, a, mm_nbuf(wt, key)); };
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
-            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, cm1_spec, false, true, 0, true, cm1_pin);
+            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, sp, false, true, 0, true, cm1_pin);
         };
         auto cm1_create_quant = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                                     const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
-            spec_fn_t qs = [&, type_a=key.type_a](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec_quant(wt, a, (uint32_t)type_a); };
+            spec_fn_t qs = [&, key](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec_quant(wt, a, (uint32_t)key.type_a, mm_nbuf(wt, key)); };
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
             if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, qs, false, true, 0, true, cm1_pin);
         };

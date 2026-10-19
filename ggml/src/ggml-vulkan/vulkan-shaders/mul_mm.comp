@@ -191,13 +191,34 @@ const bool APPLY_SLM_A_RESHAPE = false;
 #endif
 #define SHMEM_STRIDE (BK / 2 + SHMEM_STRIDE_PAD)
 
-shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
-shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
+// coopmat quant matmuls with f32 accumulators: MM_NBUF = 2 keeps two K blocks in shared memory, the next block loads
+// while the current one is multiplied, one barrier per block (set by the host for tiles where both buffers fit)
+#if defined(COOPMAT) && !defined(MUL_MAT_ID) && !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16) && !defined(ACC_TYPE_MAX)
+#define MM_DBUF_OK
+layout(constant_id = 15) const uint MM_NBUF = 1;
+#else
+const uint MM_NBUF = 1;
+#endif
+shared FLOAT_TYPEV2 buf_a[MM_NBUF * BM * SHMEM_STRIDE];
+shared FLOAT_TYPEV2 buf_b[MM_NBUF * BN * SHMEM_STRIDE];
+// shared memory offsets the loaders write to
+uint buf_a_off = 0;
+uint buf_b_off = 0;
 
 #define NUM_WARPS (BLOCK_SIZE / WARP)
 
 #ifdef COOPMAT
 shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
+#ifdef MM_DBUF_OK
+// with two tile buffers the output staging reuses buf_b (free after the K loop; f32 accumulators, 4-byte elements),
+// so that coopmat_stage is not allocated
+#define STAGE_STORE(M) if (MM_NBUF == 2) { coopMatStore(M, buf_b, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor); } \
+                       else { coopMatStore(M, coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor); }
+#define STAGE_LOAD(i) (MM_NBUF == 2 ? uintBitsToFloat(packFloat2x16(buf_b[i])) : coopmat_stage[i])
+#else
+#define STAGE_STORE(M) coopMatStore(M, coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor)
+#define STAGE_LOAD(i) coopmat_stage[i]
+#endif
 #endif
 
 #include "mul_mm_id_funcs.glsl"
@@ -362,7 +383,50 @@ void main() {
     }
 #endif
 
-    for (uint block = start_k; block < end_k; block += BK) {
+#ifdef MM_DBUF_OK
+    if (MM_NBUF == 2) {
+        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+            load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, start_k, end_k);
+        }
+        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, start_k, end_k);
+        }
+        barrier();
+
+        uint cur = 0;
+        for (uint block = start_k; block < end_k; block += BK) {
+            [[unroll]] for (uint i = 0; i < BK; i += TK) {
+                [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+                    coopMatLoad(cache_a, buf_a, cur * BM * SHMEM_STRIDE + a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                        coopMatLoad(cache_b, buf_b, cur * BN * SHMEM_STRIDE + (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                        sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
+                    }
+                }
+            }
+
+            // the next block into the other buffer (the last iteration loads its own block again: no branch, so the
+            // compiler can issue these loads before the multiplications above)
+            const uint nblock = block + BK < end_k ? block + BK : block;
+            const uint npos_a = pos_a + (nblock - start_k) / LOAD_VEC_A_EFF;
+            const uint npos_b = pos_b + (nblock - start_k) / LOAD_VEC_B_EFF;
+            buf_a_off = (cur ^ 1) * BM * SHMEM_STRIDE;
+            buf_b_off = (cur ^ 1) * BN * SHMEM_STRIDE;
+            [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+                load_a_to_shmem(npos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, nblock, end_k);
+            }
+            [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+                load_b_to_shmem(npos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, nblock, end_k);
+            }
+            barrier();
+            cur ^= 1;
+        }
+    }
+    const bool single_buffer = MM_NBUF != 2;
+#else
+    const bool single_buffer = true;
+#endif
+    for (uint block = start_k; single_buffer && block < end_k; block += BK) {
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
@@ -470,7 +534,7 @@ void main() {
 #ifdef MUL_MAT_ID
     [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
         [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-            coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+            STAGE_STORE(sums[cm_col * cms_per_row + cm_row]);
 
             barrier();
             [[unroll]] for (uint col = 0; col < TN; col += storestride) {
@@ -480,7 +544,7 @@ void main() {
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
 
                 if (dr + cm_row * TM + store_r < p.M) {
-                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(STAGE_LOAD(warp_i * TM * TN + (col + store_c) * TM + store_r));
                 }
             }
             barrier();
@@ -499,21 +563,21 @@ void main() {
                 coopMatStore(cm_dtype, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
             } else if (is_in_bounds) {
                 // Full coopMat is within bounds, but stride_d is not aligned
-                coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+                STAGE_STORE(sums[cm_col * cms_per_row + cm_row]);
 
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
-                    data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(STAGE_LOAD(warp_i * TM * TN + (col + store_c) * TM + store_r));
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
             } else if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
                 // Partial coopMat is within bounds
-                coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+                STAGE_STORE(sums[cm_col * cms_per_row + cm_row]);
 
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
                     if (dr + cm_row * TM + store_r < p.M && dc + cm_col * TN + col + store_c < p.N) {
-                        data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                        data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(STAGE_LOAD(warp_i * TM * TN + (col + store_c) * TM + store_r));
                     }
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
