@@ -5921,6 +5921,15 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
     if (ctx->device->coopmat2) {
         return prec == GGML_PREC_DEFAULT;
     }
+    // RDNA3 holds an f16 WMMA accumulator in as many registers as an f32 one, and the compiler moves loop-carried f16
+    // accumulators around in 16-bit pieces every K block: f32 accumulators are faster and more precise there (7900 XTX,
+    // 128 / 512 columns, iq3_s / iq3_xxs / iq4_xs / iq2_s / q4_K: +2..8%). RDNA4, detected as RDNA3 too, packs f16
+    // accumulators and was not measured. GGML_VK_MM_F16ACC=1 keeps f16 accumulators
+    static const bool mm_f16acc = [] { const char * e = getenv("GGML_VK_MM_F16ACC"); return e && atoi(e) != 0; }();
+    if (ctx->device->coopmat_support && !mm_f16acc && ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
+        ctx->device->architecture == AMD_RDNA3 && ctx->device->driver_id != vk::DriverId::eAmdProprietary) {
+        return false;
+    }
     if (ctx->device->coopmat_support) {
         return ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT;
     }
