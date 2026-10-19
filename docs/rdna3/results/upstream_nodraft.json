@@ -1,0 +1,50 @@
+[
+ {
+  "depth_label": "16K",
+  "prompt_tokens": 15992,
+  "prefill_t_s": 808.4,
+  "decode_t_s": 35.21,
+  "gen_tokens": 1024,
+  "draft_acceptance": null
+ },
+ {
+  "depth_label": "32K",
+  "prompt_tokens": 32119,
+  "prefill_t_s": 729.4,
+  "decode_t_s": 33.66,
+  "gen_tokens": 1024,
+  "draft_acceptance": null
+ },
+ {
+  "depth_label": "48K",
+  "prompt_tokens": 47772,
+  "prefill_t_s": 662.1,
+  "decode_t_s": 32.2,
+  "gen_tokens": 1024,
+  "draft_acceptance": null
+ },
+ {
+  "depth_label": "64K",
+  "prompt_tokens": 63804,
+  "prefill_t_s": 605.0,
+  "decode_t_s": 30.83,
+  "gen_tokens": 1024,
+  "draft_acceptance": null
+ },
+ {
+  "depth_label": "128K",
+  "prompt_tokens": 129427,
+  "prefill_t_s": 442.1,
+  "decode_t_s": 26.26,
+  "gen_tokens": 1024,
+  "draft_acceptance": null
+ },
+ {
+  "depth_label": "180K",
+  "prompt_tokens": 180470,
+  "prefill_t_s": 366.7,
+  "decode_t_s": 23.57,
+  "gen_tokens": 1024,
+  "draft_acceptance": null
+ }
+]

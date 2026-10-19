@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 440" width="900" height="440" role="img" aria-label="Token generation (decode)">
+<style>
+  .bg { fill: #fcfcfb; }
+  .t1 { fill: #0b0b0b; } .t2 { fill: #52514e; } .t3 { fill: #6f6e69; }
+  .grid { stroke: #e4e3df; } .axis { stroke: #b9b8b2; }
+  .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #1a1a19; }
+    .t1 { fill: #f0efec; } .t2 { fill: #c3c2b7; } .t3 { fill: #9d9c94; }
+    .grid { stroke: #34332f; } .axis { stroke: #57564f; }
+    .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; }
+  }
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+</style>
+<rect class="bg" width="900" height="440" rx="8"/>
+<text class="t1" x="60" y="32" font-size="19" font-weight="600">Token generation (decode)</text>
+<text class="t2" x="60" y="54" font-size="13">Qwen3.8-27B UD-Q4_K_M + DFlash2 draft, q8_0 KV, RX 7900 XTX 24 GB (Vulkan, RADV)</text>
+<rect class="s3" x="60" y="70" width="12" height="12" rx="2"/>
+<text class="t2" x="78" y="81" font-size="13">upstream, no draft</text>
+<rect class="s2" x="237.6" y="70" width="12" height="12" rx="2"/>
+<text class="t2" x="255.6" y="81" font-size="13">upstream + DFlash2</text>
+<rect class="s1" x="415.2" y="70" width="12" height="12" rx="2"/>
+<text class="t2" x="433.2" y="81" font-size="13">this fork + DFlash2</text>
+<line class="grid" x1="60" x2="880" y1="378.0" y2="378.0"/>
+<text class="t3" x="52" y="382.0" font-size="12" text-anchor="end">0</text>
+<line class="grid" x1="60" x2="880" y1="321.6" y2="321.6"/>
+<text class="t3" x="52" y="325.6" font-size="12" text-anchor="end">25</text>
+<line class="grid" x1="60" x2="880" y1="265.2" y2="265.2"/>
+<text class="t3" x="52" y="269.2" font-size="12" text-anchor="end">50</text>
+<line class="grid" x1="60" x2="880" y1="208.8" y2="208.8"/>
+<text class="t3" x="52" y="212.8" font-size="12" text-anchor="end">75</text>
+<line class="grid" x1="60" x2="880" y1="152.4" y2="152.4"/>
+<text class="t3" x="52" y="156.4" font-size="12" text-anchor="end">100</text>
+<line class="grid" x1="60" x2="880" y1="96.0" y2="96.0"/>
+<text class="t3" x="52" y="100.0" font-size="12" text-anchor="end">125</text>
+<line class="axis" x1="60" x2="880" y1="378.0" y2="378.0"/>
+<text class="t3" x="18" y="237" font-size="12" text-anchor="middle" transform="rotate(-90 18 237)">tokens per second</text>
+<path class="s3" d="M71.6,378.0 V301.6 Q71.6,298.6 74.6,298.6 H98.6 Q101.6,298.6 101.6,301.6 V378.0 Z"/>
+<path class="s2" d="M103.6,378.0 V270.8 Q103.6,267.8 106.6,267.8 H130.6 Q133.6,267.8 133.6,270.8 V378.0 Z"/>
+<path class="s1" d="M135.6,378.0 V183.8 Q135.6,180.8 138.6,180.8 H162.6 Q165.6,180.8 165.6,183.8 V378.0 Z"/>
+<text class="t1" x="150.6" y="174.8" font-size="12" font-weight="600" text-anchor="middle">87</text>
+<text class="t2" x="118.6" y="398.0" font-size="13" text-anchor="middle">16K</text>
+<text class="t1" x="118.6" y="418.0" font-size="12" font-weight="600" text-anchor="middle">1.79x</text>
+<path class="s3" d="M188.7,378.0 V305.1 Q188.7,302.1 191.7,302.1 H215.7 Q218.7,302.1 218.7,305.1 V378.0 Z"/>
+<path class="s2" d="M220.7,378.0 V276.7 Q220.7,273.7 223.7,273.7 H247.7 Q250.7,273.7 250.7,276.7 V378.0 Z"/>
+<path class="s1" d="M252.7,378.0 V180.8 Q252.7,177.8 255.7,177.8 H279.7 Q282.7,177.8 282.7,180.8 V378.0 Z"/>
+<text class="t1" x="267.7" y="171.8" font-size="12" font-weight="600" text-anchor="middle">89</text>
+<text class="t2" x="235.7" y="398.0" font-size="13" text-anchor="middle">32K</text>
+<text class="t1" x="235.7" y="418.0" font-size="12" font-weight="600" text-anchor="middle">1.92x</text>
+<path class="s3" d="M305.9,378.0 V308.4 Q305.9,305.4 308.9,305.4 H332.9 Q335.9,305.4 335.9,308.4 V378.0 Z"/>
+<path class="s2" d="M337.9,378.0 V297.9 Q337.9,294.9 340.9,294.9 H364.9 Q367.9,294.9 367.9,297.9 V378.0 Z"/>
+<path class="s1" d="M369.9,378.0 V170.9 Q369.9,167.9 372.9,167.9 H396.9 Q399.9,167.9 399.9,170.9 V378.0 Z"/>
+<text class="t1" x="384.9" y="161.9" font-size="12" font-weight="600" text-anchor="middle">93</text>
+<text class="t2" x="352.9" y="398.0" font-size="13" text-anchor="middle">48K</text>
+<text class="t1" x="352.9" y="418.0" font-size="12" font-weight="600" text-anchor="middle">2.53x</text>
+<path class="s3" d="M423.0,378.0 V311.4 Q423.0,308.4 426.0,308.4 H450.0 Q453.0,308.4 453.0,311.4 V378.0 Z"/>
+<text class="t3" x="474.0" y="372.0" font-size="11" text-anchor="start" transform="rotate(-90 474.0 372.0)">GPU hang</text>
+<path class="s1" d="M487.0,378.0 V178.3 Q487.0,175.3 490.0,175.3 H514.0 Q517.0,175.3 517.0,178.3 V378.0 Z"/>
+<text class="t1" x="502.0" y="169.3" font-size="12" font-weight="600" text-anchor="middle">90</text>
+<text class="t2" x="470.0" y="398.0" font-size="13" text-anchor="middle">64K</text>
+<text class="t1" x="470.0" y="418.0" font-size="12" font-weight="600" text-anchor="middle">2.91x</text>
+<path class="s3" d="M540.1,378.0 V321.8 Q540.1,318.8 543.1,318.8 H567.1 Q570.1,318.8 570.1,321.8 V378.0 Z"/>
+<text class="t3" x="591.1" y="372.0" font-size="11" text-anchor="start" transform="rotate(-90 591.1 372.0)">GPU hang</text>
+<path class="s1" d="M604.1,378.0 V225.2 Q604.1,222.2 607.1,222.2 H631.1 Q634.1,222.2 634.1,225.2 V378.0 Z"/>
+<text class="t1" x="619.1" y="216.2" font-size="12" font-weight="600" text-anchor="middle">69</text>
+<text class="t2" x="587.1" y="398.0" font-size="13" text-anchor="middle">128K</text>
+<text class="t1" x="587.1" y="418.0" font-size="12" font-weight="600" text-anchor="middle">2.63x</text>
+<path class="s3" d="M657.3,378.0 V327.8 Q657.3,324.8 660.3,324.8 H684.3 Q687.3,324.8 687.3,327.8 V378.0 Z"/>
+<text class="t3" x="708.3" y="372.0" font-size="11" text-anchor="start" transform="rotate(-90 708.3 372.0)">GPU hang</text>
+<path class="s1" d="M721.3,378.0 V223.6 Q721.3,220.6 724.3,220.6 H748.3 Q751.3,220.6 751.3,223.6 V378.0 Z"/>
+<text class="t1" x="736.3" y="214.6" font-size="12" font-weight="600" text-anchor="middle">70</text>
+<text class="t2" x="704.3" y="398.0" font-size="13" text-anchor="middle">180K</text>
+<text class="t1" x="704.3" y="418.0" font-size="12" font-weight="600" text-anchor="middle">2.96x</text>
+<text class="t3" x="793.4" y="372.0" font-size="11" text-anchor="start" transform="rotate(-90 793.4 372.0)">not run</text>
+<text class="t3" x="825.4" y="372.0" font-size="11" text-anchor="start" transform="rotate(-90 825.4 372.0)">no fit</text>
+<path class="s1" d="M838.4,378.0 V231.6 Q838.4,228.6 841.4,228.6 H865.4 Q868.4,228.6 868.4,231.6 V378.0 Z"/>
+<text class="t1" x="853.4" y="222.6" font-size="12" font-weight="600" text-anchor="middle">66</text>
+<text class="t2" x="821.4" y="398.0" font-size="13" text-anchor="middle">200K</text>
+<text class="t3" x="880" y="432" font-size="11" text-anchor="end">context depth (prompt tokens); bold: this fork vs the faster upstream result</text>
+</svg>

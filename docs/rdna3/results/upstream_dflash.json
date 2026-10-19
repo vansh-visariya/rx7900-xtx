@@ -1,0 +1,26 @@
+[
+ {
+  "depth_label": "16K",
+  "prompt_tokens": 15992,
+  "prefill_t_s": 656.5,
+  "decode_t_s": 48.84,
+  "gen_tokens": 1024,
+  "draft_acceptance": 0.386
+ },
+ {
+  "depth_label": "32K",
+  "prompt_tokens": 32119,
+  "prefill_t_s": 606.7,
+  "decode_t_s": 46.22,
+  "gen_tokens": 1024,
+  "draft_acceptance": 0.428
+ },
+ {
+  "depth_label": "48K",
+  "prompt_tokens": 47772,
+  "prefill_t_s": 560.7,
+  "decode_t_s": 36.83,
+  "gen_tokens": 1024,
+  "draft_acceptance": 0.353
+ }
+]

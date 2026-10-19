@@ -1,0 +1,6 @@
+{
+ "subtitle": "Qwen3.8-27B UD-Q4_K_M + DFlash2 draft, q8_0 KV, RX 7900 XTX 24 GB (Vulkan, RADV)",
+ "fork": "spec-90 8a0b44bdd, -c 220000",
+ "upstream": "ggml-org/llama.cpp master f174553e1 (2026-10-19), -c 196608",
+ "date": "2026-10-19"
+}
