@@ -8299,10 +8299,25 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // split the KV range so the last round is not mostly empty
         static const uint32_t gqa_split_mul = [] { const char * e = getenv("GGML_VK_FA_GQA_SPLIT"); return e ? (uint32_t) std::max(1, atoi(e)) : 1u; }();
         const uint32_t wgs = workgroups_x * workgroups_y * workgroups_z;
+        // GGML_VK_FA_GQA_TAIL=0: no split for 4+ rounds of workgroups
+        static const bool gqa_tail = [] { const char * e = getenv("GGML_VK_FA_GQA_TAIL"); return !e || atoi(e) != 0; }();
         if (wgs <= shader_core_count) {
             split_k = std::max(1u, shader_core_count * gqa_split_mul / wgs);
         } else if (wgs < 4 * shader_core_count) {
             split_k = CEIL_DIV(4 * shader_core_count, wgs);
+        } else if (gqa_tail) {
+            // several rounds of workgroups (prompt batches): split the KV range so that the rounds come out nearly
+            // full; each extra split costs a little (partial outputs and the reduce pass). The 27B's 512-token batch
+            // is 412 workgroups on 96 CUs: 3 splits fill 99% of 13 rounds instead of 86% of 5
+            double best = 0.0;
+            for (uint32_t s = 1; s <= 4 && KV >= s * 4 * tuning_params.block_cols; ++s) {
+                const uint32_t n = wgs * s;
+                const double eff = (double) n / (CEIL_DIV(n, shader_core_count) * shader_core_count) - 0.01 * (s - 1);
+                if (eff > best + 1e-9) {
+                    best = eff;
+                    split_k = s;
+                }
+            }
         }
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
