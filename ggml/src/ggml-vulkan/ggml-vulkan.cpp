@@ -1152,6 +1152,7 @@ struct ggml_vk_ab_env {
     bool                     fuse_mmv_add  = true;
     bool                     fuse_gdn_state = true;
     bool                     fuse_conv_state = true;
+    bool                     fuse_gdn_qk_norm = true;
     int                      conv_state_test = 0;
     bool                     fuse_mmv_epi  = true;
     bool                     submit_at_end = false;
@@ -1163,7 +1164,7 @@ struct ggml_vk_ab_env {
     uint64_t cfg_word() const {
         return (uint64_t) fuse_q8_1 | (uint64_t) fuse_mmv_add << 1 | (uint64_t) fuse_gdn_state << 2 |
                (uint64_t) fuse_conv_state << 3 | (uint64_t) submit_at_end << 4 | (uint64_t) fuse_mmv_epi << 5 |
-               (uint64_t) conv_state_test << 6;
+               (uint64_t) conv_state_test << 6 | (uint64_t) fuse_gdn_qk_norm << 9;
     }
 
     void refresh() {
@@ -1194,6 +1195,8 @@ struct ggml_vk_ab_env {
         const char * cs = getenv("GGML_VK_FUSE_CONV_STATE");
         fuse_conv_state = !cs || atoi(cs) != 0;
         conv_state_test = cs && (atoi(cs) == 2 || atoi(cs) == 3) ? atoi(cs) : 0;
+        const char * qn = getenv("GGML_VK_FUSE_GDN_QK_NORM");
+        fuse_gdn_qk_norm = !qn || atoi(qn) != 0;
         const char * me = getenv("GGML_VK_FUSE_MMV_EPI");
         fuse_mmv_epi = !me || atoi(me) != 0;
         const char * se = getenv("GGML_VK_SUBMIT_AT_END");
@@ -10277,7 +10280,8 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
 // snap: optional cache view [D, n_seqs, n_snap] the snapshots are written to instead of the dst tail
 // replay: cache fusion of a gated_delta_net_replay (state and log read from and written to the caches), or null
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const ggml_tensor * snap,
-                             const ggml_tensor * state_rows, const vk_gdn_replay_fusion * replay = nullptr) {
+                             const ggml_tensor * state_rows, const vk_gdn_replay_fusion * replay = nullptr,
+                             const vk_gdn_qk_norm_fusion * qkn = nullptr) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -10316,9 +10320,17 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         state_row  = (uint32_t)(state_rows->src[0]->nb[1] / sizeof(float));
     }
 
-    const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
-    const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
-    const uint32_t sq3 = (uint32_t)(src_q->nb[3] / sizeof(float));
+    // q and k straight from the input of the skipped L2 norm, which the kernel applies
+    const ggml_tensor * q_rows = qkn ? qkn->x : src_q;
+    if (qkn) {
+        src_buf[0] = ggml_vk_tensor_subbuffer(ctx, qkn->x);
+        src_buf[1] = src_buf[0];
+        src_buf[1].offset += qkn->n_q * qkn->x->nb[1];
+        src_buf[1].size   -= qkn->n_q * qkn->x->nb[1];
+    }
+    const uint32_t sq1 = (uint32_t)(q_rows->nb[1] / sizeof(float));
+    const uint32_t sq2 = (uint32_t)(q_rows->nb[2] / sizeof(float));
+    const uint32_t sq3 = (uint32_t)(q_rows->nb[3] / sizeof(float));
     const uint32_t sv1 = (uint32_t)(src_v->nb[1] / sizeof(float));
     const uint32_t sv2 = (uint32_t)(src_v->nb[2] / sizeof(float));
     const uint32_t sv3 = (uint32_t)(src_v->nb[3] / sizeof(float));
@@ -10386,7 +10398,8 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         state_row,
         log_E, log_R, log_row, log_out_off,
         state_w_off,
-        idx_off, log_r_off, log_w_off, nrep_off
+        idx_off, log_r_off, log_w_off, nrep_off,
+        qkn ? qkn->eps : 0.0f, qkn ? qkn->s : 0.0f
     };
 
     if (is_replay) {
@@ -12943,6 +12956,16 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 gdn_rf = &it->second;
             }
         }
+        const vk_gdn_qk_norm_fusion * gdn_qn = nullptr;
+        if ((node->op == GGML_OP_GATED_DELTA_NET || node->op == GGML_OP_GATED_DELTA_NET_REPLAY) && !ctx->gdn_qk_norm_fusions.empty()) {
+            auto it = ctx->gdn_qk_norm_fusions.find(node);
+            if (it != ctx->gdn_qk_norm_fusions.end()) {
+                gdn_qn = &it->second;
+            }
+        }
+        if (gdn_qn && !need_sync) {
+            need_sync = overlaps_unsynced(gdn_qn->x, ctx->unsynced_nodes_written);
+        }
         if (gdn_rf && !need_sync) {
             for (const ggml_tensor * t : { gdn_rf->state_rows->src[0], gdn_rf->state_rows->src[1], gdn_rf->log_rows->src[0],
                                            gdn_rf->log_rows->src[1], gdn_rf->log_set->src[1] }) {
@@ -12994,6 +13017,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         if (gdn_rows) {
             ctx->unsynced_nodes_read.push_back(gdn_rows->src[0]);
             ctx->unsynced_nodes_read.push_back(gdn_rows->src[1]);
+        }
+        if (gdn_qn) {
+            ctx->unsynced_nodes_read.push_back(gdn_qn->x);
         }
         if (gdn_rf) {
             for (const ggml_tensor * t : { gdn_rf->state_rows->src[0], gdn_rf->state_rows->src[1], gdn_rf->log_rows->src[0],
@@ -13405,9 +13431,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_GATED_DELTA_NET:
         {
             auto it = ctx->gdn_state_fusions.find(node);
+            auto qn = ctx->gdn_qk_norm_fusions.find(node);
             ggml_vk_gated_delta_net(ctx, compute_ctx, node,
                 ctx->num_additional_fused_ops ? cgraph->nodes[node_idx + ctx->num_additional_fused_ops]->src[1] : nullptr,
-                it != ctx->gdn_state_fusions.end() ? it->second : nullptr);
+                it != ctx->gdn_state_fusions.end() ? it->second : nullptr, nullptr,
+                qn != ctx->gdn_qk_norm_fusions.end() ? &qn->second : nullptr);
         }
 
         break;
@@ -13415,8 +13443,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_GATED_DELTA_NET_REPLAY:
         {
             auto it = ctx->gdn_replay_fusions.find(node);
+            auto qn = ctx->gdn_qk_norm_fusions.find(node);
             ggml_vk_gated_delta_net(ctx, compute_ctx, node, nullptr, nullptr,
-                it != ctx->gdn_replay_fusions.end() ? &it->second : nullptr);
+                it != ctx->gdn_replay_fusions.end() ? &it->second : nullptr,
+                qn != ctx->gdn_qk_norm_fusions.end() ? &qn->second : nullptr);
         }
 
         break;
@@ -15087,6 +15117,66 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
     return false;
 }
 
+// the delta-net q/k L2 norm (build_gdn_l2_norm: rms_norm, then scale) whose output only feeds the q and k views of one
+// gated_delta_net: the kernel normalizes the rows it reads (the 8-lanes-per-column variant, bit-exact with rms_norm), so
+// the norm and the scale are skipped. q is the first n_q heads of the output, k the next n_q
+static bool ggml_vk_match_gdn_qk_norm(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int gi,
+                                      vk_gdn_qk_norm_fusion & f) {
+    const vk_device & device = ctx->device;
+    const ggml_tensor * gdn = cgraph->nodes[gi];
+    if (!g_vk_ab.fuse_gdn_qk_norm || !device->subgroup_arithmetic || !device->subgroup_clustered || !device->subgroup_shuffle ||
+        device->subgroup_size <= 8 || gdn->type != GGML_TYPE_F32 || gdn->src[2]->ne[0] != 128) {
+        return false;
+    }
+    auto uses = [&](const ggml_tensor * t) {
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        return pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos) ? -1 : cgraph->use_counts[pos];
+    };
+    const ggml_tensor * q = gdn->src[0];
+    const ggml_tensor * k = gdn->src[1];
+    if (q->op != GGML_OP_VIEW || k->op != GGML_OP_VIEW || q->view_src != k->view_src || uses(q) != 1 || uses(k) != 1) {
+        return false;
+    }
+    const ggml_tensor * sc = q->view_src;
+    if (sc->op != GGML_OP_SCALE || uses(sc) != 2 || (sc->flags & GGML_TENSOR_FLAG_OUTPUT) || sc->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(sc) || sc->view_src || ggml_get_op_params_f32(sc, 1) != 0.0f) {
+        return false;
+    }
+    const ggml_tensor * nm = sc->src[0];
+    if (nm->op != GGML_OP_RMS_NORM || uses(nm) != 1 || (nm->flags & GGML_TENSOR_FLAG_OUTPUT) || nm->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(nm) || !(ggml_get_op_params_f32(nm, 0) > 0.0f)) {
+        return false;
+    }
+    const ggml_tensor * x = nm->src[0];
+    const ggml_tensor * v = gdn->src[2];
+    const int64_t n_q = q->ne[1];
+    if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || !ggml_are_same_shape(x, sc) || x->ne[0] != 128 ||
+        x->ne[1] != 2 * n_q || !x->view_src || x->view_src != v->view_src ||
+        x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0 || x->nb[3] % sizeof(float) != 0) {
+        return false;
+    }
+    if (!ggml_are_same_shape(q, k) || q->ne[0] != 128 || q->ne[2] != sc->ne[2] || q->ne[3] != sc->ne[3] ||
+        q->view_offs != 0 || k->view_offs != (size_t) n_q * sc->nb[1]) {
+        return false;
+    }
+    for (int d = 1; d < 4; ++d) {
+        if (q->nb[d] != sc->nb[d] || k->nb[d] != sc->nb[d]) {
+            return false;
+        }
+    }
+    const int ni = ggml_vk_node_pos(cgraph, nm, gi - 1, -1);
+    if (ni < 0 || !ggml_vk_fuse_read_ok(cgraph, x, ni, gi, "gdn qk norm")) {
+        return false;
+    }
+    f.x     = x;
+    f.norm  = nm;
+    f.scale = sc;
+    f.n_q   = n_q;
+    f.eps   = ggml_get_op_params_f32(nm, 0);
+    f.s     = ggml_get_op_params_f32(sc, 0);
+    return true;
+}
+
 // gated_delta_net whose state is a get_rows of whole f32 rows of the recurrent cache, used only there (through view
 // nodes): the kernel reads the cache rows itself and the get_rows is skipped. returns the get_rows, or null
 static const ggml_tensor * ggml_vk_gdn_state_rows(const struct ggml_cgraph * cgraph, const ggml_tensor * gdn) {
@@ -15914,7 +16004,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->gdn_state_fusions.clear();
     ctx->conv_state_fusions.clear();
     ctx->gdn_replay_fusions.clear();
+    ctx->gdn_qk_norm_fusions.clear();
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET || cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET_REPLAY) {
+            vk_gdn_qk_norm_fusion f;
+            if (ggml_vk_match_gdn_qk_norm(ctx, cgraph, i, f)) {
+                ctx->fused_skip.insert({ f.norm, f.scale });
+                ctx->gdn_qk_norm_fusions.emplace(cgraph->nodes[i], f);
+            }
+        }
         if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
             // the kernel reads the row index of the get_rows before it
             const ggml_tensor * rows = ggml_vk_gdn_state_rows(cgraph, cgraph->nodes[i]);

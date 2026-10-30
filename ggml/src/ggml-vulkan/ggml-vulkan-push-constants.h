@@ -703,6 +703,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t state_w_off;
     // first element of the state rows, log read rows, log write rows and replay counts in their bindings
     uint32_t idx_off, log_r_off, log_w_off, nrep_off;
+    // qk_eps > 0: q and k are the inputs of the delta-net L2 norm (rms_norm with eps qk_eps, then * qk_scale), done in the kernel
+    float qk_eps, qk_scale;
 };
 
 static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);

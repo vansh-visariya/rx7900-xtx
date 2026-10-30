@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #if USE_SUBGROUP_CLUSTERED
 #extension GL_KHR_shader_subgroup_clustered : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #endif
 #if USE_SUBGROUP_ADD
 #extension GL_KHR_shader_subgroup_arithmetic : enable
@@ -37,6 +38,8 @@ layout(push_constant) uniform Parameters {
     uint log_E, log_R, log_row, log_out_off;
     uint state_w_off;
     uint idx_off, log_r_off, log_w_off, nrep_off;
+    // qk_eps > 0: q and k are the inputs of the L2 norm rms_norm(x, qk_eps) * qk_scale, which runs here
+    float qk_eps, qk_scale;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -132,6 +135,31 @@ FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
     }
 }
 
+#if USE_SUBGROUP_CLUSTERED
+// rms_norm.comp + scale of a 128-wide row, x[r] = element r * 8 + lane of the 8 lanes of a column: the same products and
+// additions in the same order as its 512-thread tree (pairs 64, 32, 16 and 8 apart in the lane, then 4, 2, 1 across
+// lanes), so the result is bit-exact with the separate norm
+void qk_l2_norm(inout FLOAT_TYPE x[ROWS_PER_LANE]) {
+    precise FLOAT_TYPE a[8];
+    [[unroll]] for (uint k = 0; k < 8; k++) {
+        a[k] = x[k] * x[k] + x[k + 8] * x[k + 8];
+    }
+    precise FLOAT_TYPE b[4];
+    [[unroll]] for (uint k = 0; k < 4; k++) {
+        b[k] = a[k] + a[k + 4];
+    }
+    precise FLOAT_TYPE d = (b[0] + b[2]) + (b[1] + b[3]);
+    d = d + subgroupShuffleXor(d, 4u);
+    d = d + subgroupShuffleXor(d, 2u);
+    d = d + subgroupShuffleXor(d, 1u);
+    const FLOAT_TYPE sc = inversesqrt(d / FLOAT_TYPE(S_V) + FLOAT_TYPE(qk_eps));
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        precise FLOAT_TYPE v = sc * x[r];
+        x[r] = v * FLOAT_TYPE(qk_scale);
+    }
+}
+#endif
+
 void main() {
     const uint head_id = gl_WorkGroupID.x;
     const uint seq_id = gl_WorkGroupID.y;
@@ -218,6 +246,12 @@ void main() {
             k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
             q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
         }
+#if USE_SUBGROUP_CLUSTERED
+        if (S_V == 128 && LANES_PER_COLUMN == 8 && qk_eps > 0.0) {
+            qk_l2_norm(k_reg);
+            qk_l2_norm(q_reg);
+        }
+#endif
 
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0) {

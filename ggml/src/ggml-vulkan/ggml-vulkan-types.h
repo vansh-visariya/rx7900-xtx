@@ -1273,6 +1273,16 @@ struct vk_gdn_replay_fusion {
     const ggml_tensor * log_set    = nullptr; // set_rows of the new log into the log cache
 };
 
+// the delta-net q/k L2 norm (rms_norm + scale, views q and k of its output) done inside gated_delta_net
+struct vk_gdn_qk_norm_fusion {
+    const ggml_tensor * x     = nullptr; // input of the norm: q heads, then k heads
+    const ggml_tensor * norm  = nullptr;
+    const ggml_tensor * scale = nullptr;
+    int64_t n_q   = 0;    // q heads (k starts n_q rows of x later)
+    float   eps   = 0.0f;
+    float   s     = 0.0f;
+};
+
 struct vk_conv_state_fusion {
     const ggml_tensor * rows = nullptr; // get_rows of the conv cache
     const ggml_tensor * x    = nullptr; // new inputs [channels, n_t, n_s]
@@ -1351,6 +1361,7 @@ struct ggml_backend_vk_context {
     std::unordered_map<const ggml_tensor *, const ggml_tensor *> gdn_state_fusions;
     std::unordered_map<const ggml_tensor *, vk_conv_state_fusion> conv_state_fusions;
     std::unordered_map<const ggml_tensor *, vk_gdn_replay_fusion> gdn_replay_fusions;
+    std::unordered_map<const ggml_tensor *, vk_gdn_qk_norm_fusion> gdn_qk_norm_fusions;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
