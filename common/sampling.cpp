@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <cmath>
@@ -1167,6 +1168,10 @@ struct spec_stats {
     std::vector<double> sum_ov_t; // [temps.size() * N_POS]
     int64_t n_eval_t[N_POS] = {};
 
+    // LLAMA_SPEC_DUMP=FILE: one line per verify cycle (time ms, drafts, accepted, then per draft position
+    // max q, q(x), p(x), sum min(p,q), entropy of q) to replay draft-length policies offline
+    FILE * dump = nullptr;
+
     spec_stats() {
         const char * env = getenv("LLAMA_SPEC_STATS");
         if (env && atoi(env) != 0) {
@@ -1174,6 +1179,11 @@ struct spec_stats {
             if (atoi(env) > 1) {
                 interval = atoi(env);
             }
+        }
+        const char * env_d = getenv("LLAMA_SPEC_DUMP");
+        if (env_d && *env_d) {
+            dump = fopen(env_d, "a");
+            enabled = enabled || dump != nullptr;
         }
         const char * env_t = getenv("LLAMA_SPEC_TEMPS");
         if (enabled && env_t) {
@@ -1244,6 +1254,8 @@ void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const
     // clone, so the real sampler state is untouched
     common_sampler_ptr clone(common_sampler_clone(gsmpl));
 
+    std::string dump_pos;
+
     for (size_t i = 0; i < draft.size() && i < (size_t) spec_stats::N_POS; ++i) {
         common_sampler_sample(clone.get(), ctx, idxs[i], false);
         const llama_token_data_array * cur_p = common_sampler_get_candidates(clone.get(), false);
@@ -1253,6 +1265,9 @@ void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const
             psum += cur_p->data[j].p;
         }
         if (psum <= 0.0) {
+            if (st.dump) {
+                dump_pos += " -1 -1 -1 -1 -1";
+            }
             continue;
         }
 
@@ -1285,6 +1300,21 @@ void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const
         st.n_eval [i]++;
         st.sum_pex[i] += pex;
         st.sum_ov [i] += q ? ov : pex;
+
+        if (st.dump) {
+            double qx = 0.0, qmax = 0.0, ent = 0.0;
+            for (size_t k = 0; q && k < q->size(); ++k) {
+                const double qk = (*q)[k].second;
+                if ((*q)[k].first == draft[i]) {
+                    qx = qk;
+                }
+                qmax = std::max(qmax, qk);
+                if (qk > 0.0) {
+                    ent -= qk * std::log(qk);
+                }
+            }
+            dump_pos += string_format(" %.4f %.4f %.4f %.4f %.3f", qmax, qx, pex, q ? ov : pex, ent);
+        }
 
         if (!st.temps.empty() && draft_q && i < draft_q->size() && !(*draft_q)[i].empty()) {
             const auto & dq = (*draft_q)[i];
@@ -1324,6 +1354,13 @@ void spec_stats_record_verify(common_sampler * gsmpl, llama_context * ctx, const
         if (i < n_acc) {
             st.n_acc[i]++;
         }
+    }
+
+    if (st.dump) {
+        const long long t_ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        fprintf(st.dump, "%lld %zu %zu%s\n", t_ms, draft.size(), n_acc, dump_pos.c_str());
+        fflush(st.dump);
     }
 
     st.n_cycles++;
