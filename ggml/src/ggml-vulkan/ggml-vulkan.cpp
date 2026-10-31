@@ -15134,6 +15134,10 @@ static bool ggml_vk_match_gdn_qk_norm(ggml_backend_vk_context * ctx, const struc
     };
     const ggml_tensor * q = gdn->src[0];
     const ggml_tensor * k = gdn->src[1];
+    // prompt batches: the norm in the kernel's serial token loop costs more than the separate norm kernel
+    if (q->ne[2] * q->ne[3] > 8) {
+        return false;
+    }
     if (q->op != GGML_OP_VIEW || k->op != GGML_OP_VIEW || q->view_src != k->view_src || uses(q) != 1 || uses(k) != 1) {
         return false;
     }
