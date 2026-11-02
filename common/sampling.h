@@ -100,9 +100,27 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // (see common_sampler_supports_rejection) or when draft_q does not cover the draft
 // is_replay: the draft is a prefix already accepted before a checkpoint restore - accept it as is
 //
+// block: block verification instead (Sun et al. 2024, "Block Verification Accelerates Speculative Decoding", Alg. 2):
+// the draft block is accepted by one joint test over all positions, also lossless, and never accepts fewer tokens in
+// expectation than the token-by-token test. Needs the target distribution at every draft position, evaluated on a
+// clone of the sampler advanced along the draft.
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
         struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
-        const std::vector<std::vector<llama_token_data>> & draft_q, bool is_replay);
+        const std::vector<std::vector<llama_token_data>> & draft_q, bool is_replay, bool block = false);
+
+// block verification of a draft x[0..n-1], x[k] ~ q[k]: p[k] is the target distribution at draft position k (p
+// normalized, sparse), conditioned on x[0..k-1]. Fills the prefix weights w[0..n] (w[0] = 1,
+// w[k+1] = min(w[k] p[k](x[k]) / q[k](x[k]), 1)) and the accept thresholds h[1..n] (h[0] unused): with independent
+// uniforms eta_k, the accepted length is the largest k with eta_k <= h[k] (0 if there is none).
+void common_spec_block_plan(const std::vector<std::vector<llama_token_data>> & p,
+        const std::vector<std::vector<llama_token_data>> & q, const llama_tokens & x, size_t n,
+        std::vector<double> & h, std::vector<double> & w);
+
+// weights (unnormalized, over the candidates of p[tau]) of the token that follows tau accepted draft tokens:
+// max(w[tau] p[tau] - q[tau], 0) for tau < n, p[n] (the bonus position) for tau == n
+void common_spec_block_residual(const std::vector<std::vector<llama_token_data>> & p,
+        const std::vector<std::vector<llama_token_data>> & q, const std::vector<double> & w, size_t n, size_t tau,
+        std::vector<llama_token_data> & r);
 
 // one rejection-sampling step: p = cur_p (probs, need not be normalized), x ~ q
 // returns x with accepted = true, or a token from norm(max(0, p - q)) with accepted = false,

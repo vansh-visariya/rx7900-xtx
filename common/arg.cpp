@@ -4190,16 +4190,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
     add_opt(common_arg(
-        {"--spec-accept"}, "{exact,rejection}",
+        {"--spec-accept"}, "{exact,rejection,block}",
         string_format("draft verification: 'exact' accepts a draft token when it matches the target sample, 'rejection' "
                       "samples drafts from the draft distribution q and accepts with prob min(1, p/q) (lossless, more "
-                      "accepted tokens at temp > 0; MTP draft only) (default: %s)",
-                      params.speculative.accept_rejection ? "rejection" : "exact"),
+                      "accepted tokens at temp > 0; MTP and DFlash2 drafts), 'block' samples like 'rejection' and accepts "
+                      "the draft by one joint test over all positions (block verification, lossless, at least as many "
+                      "accepted tokens as 'rejection') (default: %s)",
+                      params.speculative.accept_block ? "block" : params.speculative.accept_rejection ? "rejection" : "exact"),
         [](common_params & params, const std::string & value) {
             if (value == "exact") {
                 params.speculative.accept_rejection = false;
+                params.speculative.accept_block     = false;
             } else if (value == "rejection") {
                 params.speculative.accept_rejection = true;
+                params.speculative.accept_block     = false;
+            } else if (value == "block") {
+                params.speculative.accept_rejection = true;
+                params.speculative.accept_block     = true;
             } else {
                 throw std::invalid_argument("invalid value");
             }
@@ -4212,6 +4219,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft_temp = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_TEMP"));
+    add_opt(common_arg(
+        {"--spec-draft-top-p"}, "P",
+        string_format("nucleus truncation of the draft distribution for --spec-accept rejection/block: sample each draft "
+                      "token from the smallest set of draft candidates with probability >= P (lossless) (default: %.2f, 1.0 = off)",
+                      (double) params.speculative.draft_top_p),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft_top_p = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_TOP_P"));
     add_opt(common_arg(
         {"--spec-draft-p-min", "--draft-p-min"}, "P",
         string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),

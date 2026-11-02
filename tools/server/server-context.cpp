@@ -3054,6 +3054,7 @@ private:
                             /* .sample_q = */ params_base.speculative.accept_rejection &&
                                              common_sampler_supports_rejection(slot.smpl.get()),
                             /* .temp_q   = */ params_base.speculative.draft_temp,
+                            /* .top_p_q  = */ params_base.speculative.draft_top_p,
                             /* .q        = */ {},
                         };
 
@@ -4031,7 +4032,8 @@ private:
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
                     : (dp.sample_q
                         ? common_sampler_sample_and_accept_n_rejection(
-                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, dp.q, slot.spec_is_replay)
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, dp.q, slot.spec_is_replay,
+                                params_base.speculative.accept_block)
                         : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft));
                 slot.spec_i_batch.clear();
                 common_spec_stats_add_time(COMMON_SPEC_STATS_T_ACCEPT, 1e-3*(ggml_time_us() - t_accept_start));

@@ -382,7 +382,9 @@ struct common_params_speculative {
     std::vector<double> synth_rates;
 
     bool  accept_rejection = false; // lossless rejection-sampling verification instead of exact match (MTP draft)
+    bool  accept_block     = false; // rejection sampling with block verification (one joint test over the draft)
     float draft_temp       = 1.0f;  // temperature of the draft distribution q for rejection sampling
+    float draft_top_p      = 1.0f;  // nucleus truncation of the draft distribution q before sampling (1 = off)
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;

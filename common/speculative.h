@@ -77,6 +77,7 @@ struct common_speculative_draft_params {
     // and record q[i] for result[i]. only the MTP draft implements it; otherwise q stays empty
     bool  sample_q = false;
     float temp_q   = 1.0f;
+    float top_p_q  = 1.0f; // nucleus truncation of q before sampling (DFlash2 and MTP drafts; 1 = off)
     std::vector<std::vector<llama_token_data>> q;
 };
 

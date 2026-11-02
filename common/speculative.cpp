@@ -920,6 +920,41 @@ static void common_speculative_on_submit() {
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 // LLAMA_DFLASH_DEV_INJECT=0 makes DFlash read the target features from the host instead of the device
+// nucleus truncation of a draft distribution q (weights need not be normalized): keep the smallest set of the largest
+// weights whose share reaches top_p, zero the others, return the kept sum. Rejection sampling stays exact for any q
+// as long as the verification uses the q the token was drawn from, so the truncated q is the one to keep.
+static double common_speculative_q_top_p(std::vector<llama_token_data> & q, double sum, float top_p) {
+    if (top_p >= 1.0f || q.size() < 2 || sum <= 0.0) {
+        return sum;
+    }
+    std::vector<uint32_t> ord(q.size());
+    for (uint32_t k = 0; k < ord.size(); ++k) {
+        ord[k] = k;
+    }
+    std::sort(ord.begin(), ord.end(), [&q](uint32_t a, uint32_t b) {
+        return q[a].p > q[b].p || (q[a].p == q[b].p && a < b);
+    });
+    const double target = (double) top_p * sum;
+    size_t keep = ord.size();
+    double cum = 0.0;
+    for (size_t j = 0; j < ord.size(); ++j) {
+        cum += q[ord[j]].p;
+        if (cum >= target) {
+            keep = j + 1;
+            break;
+        }
+    }
+    double kept = 0.0;
+    for (size_t j = 0; j < ord.size(); ++j) {
+        if (j < keep) {
+            kept += q[ord[j]].p;
+        } else {
+            q[ord[j]].p = 0.0f;
+        }
+    }
+    return kept;
+}
+
 static bool dflash_dev_inject_enabled() {
     static const bool enabled = [] { const char * e = getenv("LLAMA_DFLASH_DEV_INJECT"); return !e || atoi(e) != 0; }();
     return enabled;
@@ -1334,10 +1369,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             q[k] = { (llama_token) row[k], scores[k], (float) e };
                             sum += e;
                         }
+                        sum = common_speculative_q_top_p(q, sum, dp.top_p_q);
                         std::uniform_real_distribution<double> unif(0.0, 1.0);
                         double u = unif(rngs[seq_id])*sum;
-                        predecessor = selector_top_k - 1;
+                        // only if rounding leaves u > 0 (a truncated q keeps i_max, whose weight is 1)
+                        predecessor = dp.top_p_q < 1.0f ? i_max : selector_top_k - 1;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
+                            if (q[k].p <= 0.0f) {
+                                continue;
+                            }
                             u -= q[k].p;
                             if (u <= 0.0) {
                                 predecessor = k;
@@ -1436,7 +1476,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 };
 
 // sample a draft token from q = softmax(logits / temp) over the top-k draft candidates and store q
-static llama_token common_speculative_sample_q(const llama_token_data_array * cur_p, float temp, std::mt19937 & rng,
+static llama_token common_speculative_sample_q(const llama_token_data_array * cur_p, float temp, float top_p, std::mt19937 & rng,
         std::vector<llama_token_data> & q) {
     std::vector<llama_token_data> c(cur_p->data, cur_p->data + cur_p->size);
     const size_t k = std::min<size_t>(c.size(), 10);
@@ -1454,6 +1494,7 @@ static llama_token common_speculative_sample_q(const llama_token_data_array * cu
         q[j] = { c[j].id, c[j].logit, (float) e };
         sum += e;
     }
+    sum = common_speculative_q_top_p(q, sum, top_p);
     for (auto & e : q) {
         e.p = (float) (e.p / sum);
     }
@@ -1461,12 +1502,15 @@ static llama_token common_speculative_sample_q(const llama_token_data_array * cu
     std::uniform_real_distribution<double> unif(0.0, 1.0);
     double u = unif(rng);
     for (const auto & e : q) {
+        if (e.p <= 0.0f) {
+            continue;
+        }
         u -= e.p;
         if (u <= 0.0) {
             return e.id;
         }
     }
-    return q.back().id;
+    return top_p < 1.0f ? q[0].id : q.back().id; // q[0] is the argmax, kept by any truncation
 }
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -1843,7 +1887,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_token id = cur_p->data[0].id;
                 if (dp.sample_q) {
                     dp.q.emplace_back();
-                    id = common_speculative_sample_q(cur_p, dp.temp_q, rngs[seq_id], dp.q.back());
+                    id = common_speculative_sample_q(cur_p, dp.temp_q, dp.top_p_q, rngs[seq_id], dp.q.back());
                 }
 
                 // only collect very high-confidence draft tokens
