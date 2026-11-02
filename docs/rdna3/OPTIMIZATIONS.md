@@ -25,12 +25,14 @@ rounding change, the prompt-batch attention kernel and the f32 matmul accumulato
 | Command-buffer replay | a graph that repeats (verify, draft) is recorded once and resubmitted, matched by the scheduler's graph uid | `GGML_VK_GRAPH_REPLAY=0` |
 | Host path | spin wait, early first submit, one backend wait per split, KV rotation matrices kept on the device, causal KQ mask built on the device | `GGML_VK_SPIN_WAIT=0`, `GGML_VK_FIRST_SUBMIT_NODES=0`, `LLAMA_KQ_MASK_GPU=0` |
 | DFlash2 draft | layer features kept on the device, the block convolution as one `ggml_dflash_conv` op (was ~10 small nodes), deferred streaming | `LLAMA_DFLASH_DEV_INJECT=0`, `LLAMA_DFLASH_CONV_OP=0`, `LLAMA_SPEC_DEFER=0` |
+| Graphics queue (AMD dGPUs with RADV) | the work runs on the graphics queue instead of the compute-only queue: dependent dispatches are cheaper there (5-token verify at 16K -4%, same results bit for bit). A desktop on the same GPU can get less responsive | `GGML_VK_ALLOW_GRAPHICS_QUEUE=0` |
 
 ## Prefill (prompt processing)
 
 | Change | What it does | Switch (off) |
 |---|---|---|
 | 128x256 quant matmul tile | 4th tile size for batches of 256+ columns (use `-ub 512`) | - |
+| ... in 32-wide subgroups | 16 subgroups of 32x64 instead of 8 of 64x64: WMMA operands are replicated per 16 lanes, so a 64-wide subgroup held and read twice their bytes (512 columns: iq3_s / iq3_xxs / q4_K +15-17%, iq4_xs +10%, iq2 +4-6%; bit-exact) | `GGML_VK_MM_XL_WAVE=64` |
 | f32 matmul accumulators on RDNA3 | an f16 WMMA accumulator costs the same registers on RDNA3, and the compiler moved f16 accumulators in 16-bit pieces | `GGML_VK_MM_F16ACC=1` |
 | Double-buffered matmul tiles | the next K block is loaded into a second shared-memory buffer while the current one is multiplied | `GGML_VK_MM_DBUF=0` |
 | Prompt-batch flash attention (`flash_attn_cm1_gqa_pp.comp`) | 64 query rows per workgroup, S and O transposed so the softmax runs per lane, K/V dequantized once per 32-row tile | `GGML_VK_FA_GQA_PP=0` |
@@ -44,6 +46,8 @@ rounding change, the prompt-batch attention kernel and the f32 matmul accumulato
 | `--spec-accept rejection` | lossless rejection-sampling verification instead of exact match. Same output distribution, more accepted tokens at temperature > 0 |
 | `-bs` (backend sampling) | now also works with the reasoning budget and with tool-call grammars, until the grammar starts constraining |
 | `--spec-draft-vocab N` | the MTP draft head scores only the first N token ids. 65536 keeps the acceptance rate unchanged |
+| `--spec-accept block` | like `rejection`, but the draft is accepted by one joint test over all its positions (block verification, Sun et al. 2024): same output distribution, at least as many accepted tokens in expectation |
+| `--spec-draft-top-p P` | samples each draft token from the draft's own nucleus (smallest candidate set with probability >= P); verification uses that truncated q, so the output distribution is unchanged |
 
 Note: the llama-server web UI sends `backend_sampling: false` unless you tick Settings -> Sampling -> "Backend
 sampling". API clients that do not send the field get the server's `-bs` setting.
@@ -60,6 +64,8 @@ sampling". API clients that do not send the field get the server's `-bs` setting
 | `GGML_VK_FUSE_ALIAS_LOG=1` | in-place fusions skipped because of allocator overlap |
 | `GGML_SCHED_TIMING=N` | input copy and compute call time per scheduler split |
 | `LLAMA_DECODE_TIMING=N` | llama_decode phases per context |
+| `LLAMA_SPEC_DUMP=FILE` | one line per verify cycle: per draft position max q, q(x), p(x), sum min(p, q), entropy of q |
+| `LLAMA_SPEC_DUMPV=FILE` | one JSON line per verify cycle with the full draft q and target p at every draft position |
 
 ## Tests added
 
