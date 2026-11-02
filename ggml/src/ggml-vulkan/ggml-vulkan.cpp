@@ -4271,8 +4271,13 @@ vk_device ggml_vk_get_device(size_t idx) {
         std::vector<vk::QueueFamilyProperties> queue_family_props = device->physical_device.getQueueFamilyProperties();
 
         // Try to find a non-graphics compute queue and transfer-focused queues
-        // Allow overriding avoiding the graphics queue because it can increase performance on RADV
-        const bool allow_graphics_queue = (getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE") != nullptr);
+        // Allow overriding avoiding the graphics queue because it can increase performance on RADV.
+        // On by default for AMD dGPUs with RADV: the dependent dispatches of a decode graph run faster on the graphics
+        // queue (7900 XTX: 5-token verify at 16K 24.7 -> 23.7 ms, same results bit for bit; prompt batches unchanged).
+        // A desktop on the same GPU can get less responsive; GGML_VK_ALLOW_GRAPHICS_QUEUE=0 keeps the compute queue.
+        const char * gq_env = getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE");
+        const bool allow_graphics_queue = gq_env ? strcmp(gq_env, "0") != 0 :
+            device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eMesaRadv && !device->uma;
         const vk::QueueFlagBits graphics_flag = allow_graphics_queue ? (vk::QueueFlagBits)0 : vk::QueueFlagBits::eGraphics;
         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
         const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
