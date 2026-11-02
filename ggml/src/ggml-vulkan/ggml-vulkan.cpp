@@ -1723,6 +1723,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmqid_int, m_warptile_mmqid_int, s_warptile_mmqid_int,
                           l_warptile_mmqid_int_k, m_warptile_mmqid_int_k, s_warptile_mmqid_int_k,
                           xl_warptile_mmq;
+    uint32_t xl_pin_sg = 0;
     std::array<uint32_t, 3> l_wg_denoms, m_wg_denoms, s_wg_denoms,
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
@@ -1842,6 +1843,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->architecture != AMD_GCN &&
                 device->driver_id != vk::DriverId::eAmdProprietary) {
             xl_warptile_mmq = { 512, 128, 256, 32, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
+            // in 32-wide subgroups: the WMMA A/B fragments are replicated per 16 lanes, so a 64-wide subgroup holds and
+            // reads from shared memory twice their bytes. 16 subgroups of 32 x 64 (7900 XTX, 512 columns: iq3_s
+            // 61.0 -> 71.2, iq3_xxs 61.8 -> 71.4, iq4_xs 60.3 -> 66.2, q4_K 63.0 -> 73.6, iq2_s 58.8 -> 61.0 TFLOPS;
+            // same results bit for bit). GGML_VK_MM_XL_WAVE=64 keeps 8 subgroups of 64 x 64
+            const char * xe = getenv("GGML_VK_MM_XL_WAVE");
+            if (!(xe && atoi(xe) == 64) && device->subgroup_size_control && device->subgroup_require_full_support &&
+                    device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32) {
+                xl_warptile_mmq = { 512, 128, 256, 32, 32, 64, 2, tm_m, tn_m, tk_m, 32 };
+                xl_pin_sg = 32;
+            }
         }
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
@@ -2240,8 +2251,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const auto& tc = tile_configs[i];
 
             // Intel coopmat1 pins the required subgroup size to each warptile's WARP element.
-            const uint32_t rsgs = pin_subgroup_to_warp ? tc.warptile[WARP_SIZE_IDX] : required_subgroup_size;
-            const bool     rfs  = require_full_subgroups || pin_subgroup_to_warp;
+            const uint32_t rsgs = tc.pin_sg ? tc.pin_sg : pin_subgroup_to_warp ? tc.warptile[WARP_SIZE_IDX] : required_subgroup_size;
+            const bool     rfs  = require_full_subgroups || pin_subgroup_to_warp || tc.pin_sg != 0;
 
             if (first_call) {
                 vk_matmul_pipeline_pair pair{};
@@ -2296,7 +2307,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     std::vector<vk_tile_config> tc_mm = {{s_warptile, s_wg_denoms, s_align}, {m_warptile, m_wg_denoms, m_align}, {l_warptile, l_wg_denoms, l_align}};
     std::vector<vk_tile_config> tc_mmq = {{s_warptile_mmq, s_mmq_wg_denoms, s_align}, {m_warptile_mmq, m_mmq_wg_denoms, m_align}, {l_warptile_mmq, l_mmq_wg_denoms, l_align}};
     if (!xl_warptile_mmq.empty()) {
-        tc_mmq.push_back({xl_warptile_mmq, {xl_warptile_mmq[1], xl_warptile_mmq[2], 1}, l_align});
+        tc_mmq.push_back({xl_warptile_mmq, {xl_warptile_mmq[1], xl_warptile_mmq[2], 1}, l_align, xl_pin_sg});
     }
 
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
@@ -2426,7 +2437,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         auto mm_nbuf = [&](const std::vector<uint32_t>& wt, const vk_matmul_pipeline_key& key) -> uint32_t {
             const bool quant = key.type_a != GGML_TYPE_F32 && key.type_a != GGML_TYPE_F16 && key.type_a != GGML_TYPE_BF16;
             if (!mm_dbuf || !quant || key.f16acc || key.mul_mat_id || device->vendor_id != VK_VENDOR_ID_AMD ||
-                device->driver_id == vk::DriverId::eAmdProprietary || wt[0] != 512) {
+                device->driver_id == vk::DriverId::eAmdProprietary || wt[2] != 256) {
                 return 1;
             }
             return ggml_vk_matmul_shmem_support(device, wt, false, key.type_a, 2) ? 2 : 1;

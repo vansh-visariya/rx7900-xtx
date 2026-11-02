@@ -296,6 +296,7 @@ struct vk_tile_config {
     std::vector<uint32_t> warptile;
     std::array<uint32_t, 3> wg_denoms;
     uint32_t align;
+    uint32_t pin_sg = 0; // nonzero: the pipelines require this subgroup size (full subgroups)
 };
 
 using matmul_tile_selector_t = std::function<uint32_t(
