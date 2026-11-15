@@ -757,8 +757,20 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     }
 #endif
 
+    // GGML_VK_TRACE_PIPELINES=1: log every pipeline before and after the driver compiles it (finds driver compiler crashes)
+    static const bool trace_pipelines = [] { const char * e = getenv("GGML_VK_TRACE_PIPELINES"); return e && atoi(e) != 0; }();
+    if (trace_pipelines) {
+        std::string sc;
+        for (uint32_t c : specialization_constants) { sc += std::to_string(c) + ","; }
+        fprintf(stderr, "ggml_vulkan: compiling %s spv=%zu sg=%u full=%d spec=[%s]\n", pipeline->name.c_str(), spv_size, required_subgroup_size, (int) require_full_subgroups, sc.c_str());
+        fflush(stderr);
+    }
     try {
         pipeline->pipeline = device->device.createComputePipeline(VK_NULL_HANDLE, compute_pipeline_create_info).value;
+        if (trace_pipelines) {
+            fprintf(stderr, "ggml_vulkan: compiled  %s\n", pipeline->name.c_str());
+            fflush(stderr);
+        }
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Compute pipeline creation failed for " << pipeline->name << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
@@ -1406,7 +1418,9 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     if (path == FA_COOPMAT2 && k_type == GGML_TYPE_BF16 && !device->coopmat2_bf16_support) {
         path = FA_COOPMAT1;
     }
-    if (path == FA_COOPMAT1 && k_type == GGML_TYPE_BF16 && !device->coopmat_bf16_support) {
+    // the AMD proprietary driver (Adrenalin 26.10.1) crashes compiling the coopmat1 flash attention shader with bf16 K/V
+    if (path == FA_COOPMAT1 && k_type == GGML_TYPE_BF16 &&
+        (!device->coopmat_bf16_support || device->driver_id == vk::DriverId::eAmdProprietary)) {
         path = FA_SCALAR;
     }
 
@@ -1686,6 +1700,32 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 #endif
 }
 
+// Port of upstream #31587: AMD proprietary drivers before 2.0.416 (Adrenalin 26.10.1) run the large coopmat matmul tile
+// much slower than the medium one; fixed drivers get the RADV configuration. GGML_VK_AMD_LARGE_TILE=0 keeps the old gate
+static bool ggml_vk_amd_large_tile_supported(const vk_device& device) {
+    if (device->driver_id != vk::DriverId::eAmdProprietary) {
+        return true;
+    }
+    static const bool enabled = [] { const char * e = getenv("GGML_VK_AMD_LARGE_TILE"); return !e || atoi(e) != 0; }();
+    if (!enabled) {
+        return false;
+    }
+    // AMD encodes driverVersion as major [31:22], build [21:0], not VK_MAKE_API_VERSION.
+    const uint32_t major = device->properties.driverVersion >> 22;
+    const uint32_t build = device->properties.driverVersion & 0x3fffff;
+    return major > 2 || (major == 2 && build >= 416);
+}
+
+// The fork's own RADV-only matmul work (128x256 tile, double-buffered tiles, f32 accumulators) was never run on the AMD
+// proprietary driver: opt in with GGML_VK_AMD_PROP_XL=1 on a driver that passes the large-tile check
+static bool ggml_vk_amd_radv_tuning_supported(const vk_device& device) {
+    if (device->driver_id != vk::DriverId::eAmdProprietary) {
+        return true;
+    }
+    static const bool opt_in = [] { const char * e = getenv("GGML_VK_AMD_PROP_XL"); return e && atoi(e) != 0; }();
+    return opt_in && ggml_vk_amd_large_tile_supported(device);
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -1828,7 +1868,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
             m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
-        } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
+        } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && ggml_vk_amd_large_tile_supported(device)) {
             // This is intentionally using tx_m values, slight performance increase
             l_warptile = { 256, 128, 128, 16, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
@@ -1841,7 +1881,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // (prompt processing with -ub 512). A dequantized A tile serves twice the columns: 7900 XTX, 512 columns,
         // iq3_xxs 50.4 -> 54.3 TFLOPS, iq3_s 52.9 -> 54.5, iq4_xs 53.0 -> 53.8, iq2_s 57.3 -> 56.8
         if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->architecture != AMD_GCN &&
-                device->driver_id != vk::DriverId::eAmdProprietary) {
+                ggml_vk_amd_radv_tuning_supported(device)) {
             xl_warptile_mmq = { 512, 128, 256, 32, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
             // in 32-wide subgroups: the WMMA A/B fragments are replicated per 16 lanes, so a 64-wide subgroup holds and
             // reads from shared memory twice their bytes. 16 subgroups of 32 x 64 (7900 XTX, 512 columns: iq3_s
@@ -2437,7 +2477,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         auto mm_nbuf = [&](const std::vector<uint32_t>& wt, const vk_matmul_pipeline_key& key) -> uint32_t {
             const bool quant = key.type_a != GGML_TYPE_F32 && key.type_a != GGML_TYPE_F16 && key.type_a != GGML_TYPE_BF16;
             if (!mm_dbuf || !quant || key.f16acc || key.mul_mat_id || device->vendor_id != VK_VENDOR_ID_AMD ||
-                device->driver_id == vk::DriverId::eAmdProprietary || wt[2] != 256) {
+                !ggml_vk_amd_radv_tuning_supported(device) || wt[2] != 256) {
                 return 1;
             }
             return ggml_vk_matmul_shmem_support(device, wt, false, key.type_a, 2) ? 2 : 1;
@@ -4787,7 +4827,7 @@ vk_device ggml_vk_get_device(size_t idx) {
             switch (device->vendor_id) {
 #ifndef GGML_VULKAN_RUN_TESTS
             case VK_VENDOR_ID_AMD:
-                device->mul_mat_l[i]    = device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary;
+                device->mul_mat_l[i]    = device->coopmat_support && ggml_vk_amd_large_tile_supported(device);
                 device->mul_mat_m[i]    = true;
                 device->mul_mat_s[i]    = true;
                 device->mul_mat_id_l[i] = false;
@@ -5872,8 +5912,24 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         return 1;
     }
 
+    // Ports of upstream #30146 (small n) and #30280 (large tiles) for RDNA3/4; this fork reports RDNA4 as AMD_RDNA3.
+    // GGML_VK_SPLIT_K_SMALLN=0 / GGML_VK_SPLIT_K_LARGE=0 switch each rule off
+    static const bool split_smalln = [] { const char * e = getenv("GGML_VK_SPLIT_K_SMALLN"); return !e || atoi(e) != 0; }();
+    static const bool split_large  = [] { const char * e = getenv("GGML_VK_SPLIT_K_LARGE");  return !e || atoi(e) != 0; }();
+    const bool rdna = ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == AMD_RDNA3;
+    const bool rdna_smalln = rdna && split_smalln;
+
     uint32_t split_k = 1;
-    if (ctx->device->shader_core_count != 0 && n >= pipeline->wg_denoms[1]) {
+    if (rdna_smalln && ctx->device->shader_core_count != 0 && k >= 2048 && n <= 32) {
+        // Small n gives too few workgroups to hide latency, aim for 8 per CU. Small tiles are one subgroup each.
+        const uint32_t tiles = CEIL_DIV(m, pipeline->wg_denoms[0]) * CEIL_DIV(n, pipeline->wg_denoms[1]);
+        if (tiles < 4 * ctx->device->shader_core_count) {
+            split_k = std::min(8u, CEIL_DIV(8 * ctx->device->shader_core_count, tiles));
+        }
+    }
+
+    // On RDNA, also split when n <= 64 only partly fills one tile column.
+    if (split_k == 1 && ctx->device->shader_core_count != 0 && (n >= pipeline->wg_denoms[1] || (rdna_smalln && n <= 64))) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
@@ -5883,25 +5939,30 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
                 split_k = ctx->device->shader_core_count / (m_tiles * n_tiles);
             } else if (m_tiles * n_tiles <= ctx->device->shader_core_count * 2 / 3) {
                 split_k = 3;
+            } else if (rdna && split_large &&
+                       m_tiles * n_tiles > ctx->device->shader_core_count &&
+                       m_tiles * n_tiles <= ctx->device->shader_core_count * 4 / 3) {
+                // two waves, the second one at most 1/3 full
+                split_k = 3;
             }
             // Cap the split at 8x. Unless k is huge this is a lot of overhead.
             split_k = std::min(split_k, 8u);
-
-            // ggml_vk_matmul will align the splits to be a multiple of 256.
-            // If this rounded up size would cause the last split to be empty,
-            // then reduce the split count.
-            while (true) {
-                if (split_k == 1) {
-                    break;
-                }
-                uint32_t k_split = CEIL_DIV(k, split_k);
-                k_split = ROUNDUP_POW2(k_split, 256);
-                if (k_split * (split_k - 1) < k) {
-                    break;
-                }
-                split_k--;
-            }
         }
+    }
+
+    // ggml_vk_matmul will align the splits to be a multiple of 256.
+    // If this rounded up size would cause the last split to be empty,
+    // then reduce the split count.
+    while (true) {
+        if (split_k == 1) {
+            break;
+        }
+        uint32_t k_split = CEIL_DIV(k, split_k);
+        k_split = ROUNDUP_POW2(k_split, 256);
+        if (k_split * (split_k - 1) < k) {
+            break;
+        }
+        split_k--;
     }
 
     return split_k;
@@ -5972,7 +6033,7 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
     // accumulators and was not measured. GGML_VK_MM_F16ACC=1 keeps f16 accumulators
     static const bool mm_f16acc = [] { const char * e = getenv("GGML_VK_MM_F16ACC"); return e && atoi(e) != 0; }();
     if (ctx->device->coopmat_support && !mm_f16acc && ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
-        ctx->device->architecture == AMD_RDNA3 && ctx->device->driver_id != vk::DriverId::eAmdProprietary) {
+        ctx->device->architecture == AMD_RDNA3 && ggml_vk_amd_radv_tuning_supported(ctx->device)) {
         return false;
     }
     if (ctx->device->coopmat_support) {
@@ -8152,8 +8213,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     // larger batches (prompt processing) also take the grouped-query layout and run on the coopmat1 GQA shader,
     // which dequantizes K/V itself instead of the f16 scratch copy: 7900 XTX, 6:1 GQA, q8_0 KV, 512-token batches
-    // 28 vs 18 TFLOPS (GGML_VK_FA_GQA_PREFILL=0 disables)
-    static const bool gqa_prefill = [] { const char * e = getenv("GGML_VK_FA_GQA_PREFILL"); return !e || atoi(e) != 0; }();
+    // 28 vs 18 TFLOPS (GGML_VK_FA_GQA_PREFILL=0 disables, =1 forces). On the AMD proprietary driver the f16 scratch copy
+    // is faster for batches of 64+ tokens (RX 9070, q4_0 KV, 32K prefill: 777 vs 615 t/s), so those keep it by default
+    static const int gqa_prefill_env = [] { const char * e = getenv("GGML_VK_FA_GQA_PREFILL"); return e ? (atoi(e) != 0 ? 1 : 0) : -1; }();
+    const bool gqa_prefill = gqa_prefill_env >= 0 ? gqa_prefill_env != 0
+                                                  : (ctx->device->driver_id != vk::DriverId::eAmdProprietary || neq1 < 64);
     const bool gqa_large_ok = gqa_prefill && neq1 > 8 && ctx->device->coopmat1_fa_support && !ctx->device->coopmat2 &&
                               neq2 > nek2 && neq2 % nek2 == 0 && neq2 / nek2 <= 16 &&
                               HSK % 64 == 0 && HSV % 64 == 0 && k->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_BF16;
@@ -8260,15 +8324,20 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             const uint32_t kch = sg >= 8 ? 32 : 64;
             const uint32_t wg  = sg * gqa_sgs;
             // q8_0 K/V load in 8-quant octets: 32-dim blocks per subgroup and 4-byte aligned rows
-            const bool k_oct_ok = k_type_eff != GGML_TYPE_Q8_0 ||
+            // q4_0 takes the same octet loads as q8_0 (18-byte blocks, two lanes per 8 quant bytes: low / high nibbles)
+            const bool k_is_oct = k_type_eff == GGML_TYPE_Q8_0 || k_type_eff == GGML_TYPE_Q4_0;
+            const bool v_is_oct = v_type_eff == GGML_TYPE_Q8_0 || v_type_eff == GGML_TYPE_Q4_0;
+            const bool k_oct_ok = !k_is_oct ||
                                   (gqa_sgs % (kch / 8) == 0 && (16 * kch / 8) % gqa_sgs == 0 &&
                                    nbk1 % 4 == 0 && nbk2 % 4 == 0 && nbk3 % 4 == 0);
             // V^T is staged in pairs of rows, so a lane needs at least 2 consecutive V rows
-            const bool v_oct_ok = v_type_eff != GGML_TYPE_Q8_0 ||
+            const bool v_oct_ok = !v_is_oct ||
                                   ((HSV / sg) % 32 == 0 && gqa_sgs % (HSV / sg / 8) == 0 && 16 * (HSV / sg / 8) >= 2 * gqa_sgs &&
                                    nbv1 % 4 == 0 && nbv2 % 4 == 0 && nbv3 % 4 == 0);
-            const bool v_rows_ok = v_type_eff == GGML_TYPE_Q8_0 || 16 * (HSV / sg / 4) >= 2 * gqa_sgs;
-            if (HSK % kch == 0 && HSV % (16 * sg) == 0 && wg / gqa_br <= gqa_sgs && k_oct_ok && v_oct_ok && v_rows_ok &&
+            const bool v_rows_ok = v_is_oct || 16 * (HSV / sg / 4) >= 2 * gqa_sgs;
+            // the shader keeps the output in 8 separate accumulator matrices (row tiles x HSV tiles per subgroup)
+            const bool o_tiles_ok = (gqa_br / 16) * (HSV / sg / 16) <= 8;
+            if (HSK % kch == 0 && HSV % (16 * sg) == 0 && wg / gqa_br <= gqa_sgs && k_oct_ok && v_oct_ok && v_rows_ok && o_tiles_ok &&
                 (16 * kch / 4) % gqa_sgs == 0 && (16 * HSV / sg / 4) % gqa_sgs == 0 && gqa_sgs % (HSV / sg / 4) == 0 &&
                 wg <= ctx->device->properties.limits.maxComputeWorkGroupSize[0] &&
                 ggml_vk_flash_attn_gqa_shmem_support(ctx->device, gqa_br, sg, HSK, HSV, f32acc)) {
@@ -15542,7 +15611,14 @@ static bool ggml_vk_replay_uses(const ggml_cgraph * cgraph, F && f) {
     for (size_t w = 0; w < n_words; w++) {
         ggml_bitset_t bits = hs.used[w];
         while (bits) {
+#if defined(_MSC_VER) && !defined(__clang__)
+            // Windows port: MSVC has no __builtin_ctz
+            unsigned long ctz_idx = 0;
+            _BitScanForward(&ctz_idx, (unsigned long) bits);
+            const size_t i = (w << BITSET_SHR) + ctz_idx;
+#else
             const size_t i = (w << BITSET_SHR) + __builtin_ctz(bits);
+#endif
             bits &= bits - 1;
             if (!f(hs.keys[i], cgraph->use_counts[i])) {
                 return false;

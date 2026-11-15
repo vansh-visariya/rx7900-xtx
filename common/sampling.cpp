@@ -1635,9 +1635,14 @@ void common_spec_trace(const char * label) {
     static int64_t      c_prev = 0;
 
     const int64_t t = ggml_time_us();
+#if defined(_WIN32)
+    // Windows port: no clock_gettime; this trace is diagnostic only, so thread CPU time falls back to wall time
+    const int64_t c = t;
+#else
     timespec ts;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     const int64_t c = (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+#endif
     if (prev) {
         const std::string key = std::string(prev) + " -> " + label;
         auto it = accs.find(key);

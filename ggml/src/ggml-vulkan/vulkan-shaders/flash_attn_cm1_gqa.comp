@@ -31,6 +31,35 @@
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
 
+// The S, P and O matrices are separate variables, not arrays: storing to an element of an array of cooperative
+// matrices inside the KV loop crashes the AMD proprietary driver's compiler (amdvlk64.dll access violation in
+// createComputePipeline, Adrenalin 26.10.1). Br is 16 or 32 (1 or 2 row tiles) and the host checks
+// row_tiles * hsv_tiles <= 8. The index is a constant once the [[unroll]] loops are unrolled.
+#define ACC_MAT coopmat<ACC_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define A_MAT   coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+
+#define S_MULADD(t, A, B) { if ((t) == 0) { S0 = coopMatMulAdd(A, B, S0); } else { S1 = coopMatMulAdd(A, B, S1); } }
+
+#define O_SCALE(i, Dm) { \
+    if ((i) == 0) { O0 = O0 * Dm; } else if ((i) == 1) { O1 = O1 * Dm; } else if ((i) == 2) { O2 = O2 * Dm; } else if ((i) == 3) { O3 = O3 * Dm; } \
+    else if ((i) == 4) { O4 = O4 * Dm; } else if ((i) == 5) { O5 = O5 * Dm; } else if ((i) == 6) { O6 = O6 * Dm; } else { O7 = O7 * Dm; } }
+
+#define O_MULADD(i, A, B) { \
+    if ((i) == 0) { O0 = coopMatMulAdd(A, B, O0); } else if ((i) == 1) { O1 = coopMatMulAdd(A, B, O1); } \
+    else if ((i) == 2) { O2 = coopMatMulAdd(A, B, O2); } else if ((i) == 3) { O3 = coopMatMulAdd(A, B, O3); } \
+    else if ((i) == 4) { O4 = coopMatMulAdd(A, B, O4); } else if ((i) == 5) { O5 = coopMatMulAdd(A, B, O5); } \
+    else if ((i) == 6) { O6 = coopMatMulAdd(A, B, O6); } else { O7 = coopMatMulAdd(A, B, O7); } }
+
+#define O_STORE(i, buf, off, stride) { \
+    if ((i) == 0) { coopMatStore(O0, buf, off, stride, gl_CooperativeMatrixLayoutRowMajor); } \
+    else if ((i) == 1) { coopMatStore(O1, buf, off, stride, gl_CooperativeMatrixLayoutRowMajor); } \
+    else if ((i) == 2) { coopMatStore(O2, buf, off, stride, gl_CooperativeMatrixLayoutRowMajor); } \
+    else if ((i) == 3) { coopMatStore(O3, buf, off, stride, gl_CooperativeMatrixLayoutRowMajor); } \
+    else if ((i) == 4) { coopMatStore(O4, buf, off, stride, gl_CooperativeMatrixLayoutRowMajor); } \
+    else if ((i) == 5) { coopMatStore(O5, buf, off, stride, gl_CooperativeMatrixLayoutRowMajor); } \
+    else if ((i) == 6) { coopMatStore(O6, buf, off, stride, gl_CooperativeMatrixLayoutRowMajor); } \
+    else { coopMatStore(O7, buf, off, stride, gl_CooperativeMatrixLayoutRowMajor); } }
+
 #include "types.glsl"
 #include "flash_attn_base.glsl"
 #include "flash_attn_dequant.glsl"
@@ -97,29 +126,53 @@ FLOAT_TYPEV4 fa_q8_0_4(const uint q, const float16_t d) {
     return FLOAT_TYPEV4(a.x, b.x, a.y, b.y);
 }
 
+// q4_0 shares the octet layout: an 18-byte block is the scale and 16 quant bytes, the low nibbles are quants 0..15 and
+// the high nibbles quants 16..31, so the lanes of octets o and o + 2 load the same 8 bytes (octet o & 1 of the block)
+// and take the low or the high nibbles (nib_hi). A nibble n becomes the half 1024 + n, and subtracting 1032 gives n - 8.
+const bool K_OCT = FaTypeK == GGML_TYPE_Q8_0 || FaTypeK == GGML_TYPE_Q4_0;
+const bool V_OCT = FaTypeV == GGML_TYPE_Q8_0 || FaTypeV == GGML_TYPE_Q4_0;
+const bool K_Q4  = FaTypeK == GGML_TYPE_Q4_0;
+const bool V_Q4  = FaTypeV == GGML_TYPE_Q4_0;
+const uint32_t K_BLK_BYTES = K_Q4 ? 18 : 34;
+const uint32_t V_BLK_BYTES = V_Q4 ? 18 : 34;
+
 // decode an octet loaded by fa_load_octet_*; odd: the block starts 2 bytes past a 4-byte boundary
-void fa_q8_0_octet(const uvec3 w, const bool odd, out FLOAT_TYPEV4 lo, out FLOAT_TYPEV4 hi) {
+void fa_q8_0_octet(const uvec3 w, const bool odd, const bool q4, const bool nib_hi, out FLOAT_TYPEV4 lo, out FLOAT_TYPEV4 hi) {
     const uint q0 = odd ? w.y : (w.x >> 16) | (w.y << 16);
     const uint q1 = odd ? w.z : (w.y >> 16) | (w.z << 16);
     const uint db = subgroupQuadBroadcast(odd ? (w.x >> 16) : (w.x & 0xFFFFu), 0);
     const float16_t d = uint16BitsToFloat16(uint16_t(db));
-    lo = fa_q8_0_4(q0, d);
-    hi = fa_q8_0_4(q1, d);
+    if (q4) {
+        const uint sh = nib_hi ? 4u : 0u;
+        const uint x0 = (q0 >> sh) & 0x0F0F0F0Fu;
+        const uint x1 = (q1 >> sh) & 0x0F0F0F0Fu;
+        const f16vec2 a0 = (unpackFloat2x16((x0 & 0x00FF00FFu) | 0x64006400u) - float16_t(1032.0)) * d;
+        const f16vec2 b0 = (unpackFloat2x16(((x0 >> 8) & 0x00FF00FFu) | 0x64006400u) - float16_t(1032.0)) * d;
+        const f16vec2 a1 = (unpackFloat2x16((x1 & 0x00FF00FFu) | 0x64006400u) - float16_t(1032.0)) * d;
+        const f16vec2 b1 = (unpackFloat2x16(((x1 >> 8) & 0x00FF00FFu) | 0x64006400u) - float16_t(1032.0)) * d;
+        lo = FLOAT_TYPEV4(a0.x, b0.x, a0.y, b0.y);
+        hi = FLOAT_TYPEV4(a1.x, b1.x, a1.y, b1.y);
+    } else {
+        lo = fa_q8_0_4(q0, d);
+        hi = fa_q8_0_4(q1, d);
+    }
 }
 
 // decode an octet into words of half pairs as fa_q8_0_4 makes them: w[0] = (x0, x2), w[1] = (x1, x3), w[2] = (x4, x6),
 // w[3] = (x5, x7) for quants x0..x7 times the scale
-uvec4 fa_q8_0_octet_w(const uvec3 w, const bool odd) {
+uvec4 fa_q8_0_octet_w(const uvec3 w, const bool odd, const bool q4, const bool nib_hi) {
     const uint q0 = odd ? w.y : (w.x >> 16) | (w.y << 16);
     const uint q1 = odd ? w.z : (w.y >> 16) | (w.z << 16);
     const uint db = subgroupQuadBroadcast(odd ? (w.x >> 16) : (w.x & 0xFFFFu), 0);
     const float16_t d = uint16BitsToFloat16(uint16_t(db));
-    const uint x0 = q0 ^ 0x80808080u;
-    const uint x1 = q1 ^ 0x80808080u;
-    return uvec4(packFloat2x16((unpackFloat2x16((x0 & 0x00FF00FFu) | 0x64006400u) - float16_t(1152.0)) * d),
-                 packFloat2x16((unpackFloat2x16(((x0 >> 8) & 0x00FF00FFu) | 0x64006400u) - float16_t(1152.0)) * d),
-                 packFloat2x16((unpackFloat2x16((x1 & 0x00FF00FFu) | 0x64006400u) - float16_t(1152.0)) * d),
-                 packFloat2x16((unpackFloat2x16(((x1 >> 8) & 0x00FF00FFu) | 0x64006400u) - float16_t(1152.0)) * d));
+    const uint sh = nib_hi ? 4u : 0u;
+    const uint x0 = q4 ? (q0 >> sh) & 0x0F0F0F0Fu : q0 ^ 0x80808080u;
+    const uint x1 = q4 ? (q1 >> sh) & 0x0F0F0F0Fu : q1 ^ 0x80808080u;
+    const float16_t bias = q4 ? float16_t(1032.0) : float16_t(1152.0);
+    return uvec4(packFloat2x16((unpackFloat2x16((x0 & 0x00FF00FFu) | 0x64006400u) - bias) * d),
+                 packFloat2x16((unpackFloat2x16(((x0 >> 8) & 0x00FF00FFu) | 0x64006400u) - bias) * d),
+                 packFloat2x16((unpackFloat2x16((x1 & 0x00FF00FFu) | 0x64006400u) - bias) * d),
+                 packFloat2x16((unpackFloat2x16(((x1 >> 8) & 0x00FF00FFu) | 0x64006400u) - bias) * d));
 }
 
 // shared arrays read as matrix operands hold 8 halves per element, so the operand loads are 16 bytes wide
@@ -192,10 +245,14 @@ void main() {
     float Mrow = NEG_FLT_MAX_OVER_2;
     float Lrow = 0;
 
-    coopmat<ACC_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> O[row_tiles * hsv_tiles];
-    [[unroll]] for (uint32_t i = 0; i < row_tiles * hsv_tiles; ++i) {
-        O[i] = coopmat<ACC_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-    }
+    ACC_MAT O0 = ACC_MAT(0.0);
+    ACC_MAT O1 = ACC_MAT(0.0);
+    ACC_MAT O2 = ACC_MAT(0.0);
+    ACC_MAT O3 = ACC_MAT(0.0);
+    ACC_MAT O4 = ACC_MAT(0.0);
+    ACC_MAT O5 = ACC_MAT(0.0);
+    ACC_MAT O6 = ACC_MAT(0.0);
+    ACC_MAT O7 = ACC_MAT(0.0);
 
     const uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
     const uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FaBlockBytesV;
@@ -206,12 +263,17 @@ void main() {
 
     // q8_0: this lane's byte offset of its first octet (row, block, octet); the rest of an octet's offset is
     // uniform, so the loads need no per-load address math. The block parity is known per lane.
-    const uint32_t k_row_bytes = k_stride * 34;
-    const uint32_t v_row_bytes = v_stride * 34;
+    const uint32_t k_row_bytes = k_stride * K_BLK_BYTES;
+    const uint32_t v_row_bytes = v_stride * V_BLK_BYTES;
     const uint32_t k_oct = lane % LPRK;
-    const uint32_t k_lane8 = ik2*p.nb12 + ik3*p.nb13 + (lane / LPRK) * U_K * k_row_bytes + (k_oct / 4) * 34 + (k_oct % 4) * 8;
+    // q4_0: octets 2 and 3 of a block are the high nibbles of the bytes of octets 0 and 1
+    const bool     k_nib_hi = (k_oct % 4) >= 2;
+    const uint32_t k_oct_b  = K_Q4 ? (k_oct % 4) & 1 : k_oct % 4;
+    const uint32_t k_lane8 = ik2*p.nb12 + ik3*p.nb13 + (lane / LPRK) * U_K * k_row_bytes + (k_oct / 4) * K_BLK_BYTES + k_oct_b * 8;
     const uint32_t v_dim0 = sg * hsv_per_sg + (lane % LPRV) * 8;
-    const uint32_t v_lane8 = iv2*p.nb22 + iv3*p.nb23 + (lane / LPRV) * U_V * v_row_bytes + (v_dim0 / 32) * 34 + (v_dim0 % 32);
+    const bool     v_nib_hi = (v_dim0 % 32) >= 16;
+    const uint32_t v_oct_b  = V_Q4 ? (v_dim0 % 32) & 8 : v_dim0 % 32;
+    const uint32_t v_lane8 = iv2*p.nb22 + iv3*p.nb23 + (lane / LPRV) * U_V * v_row_bytes + (v_dim0 / 32) * V_BLK_BYTES + v_oct_b;
     const bool v_odd = ((v_dim0 / 32) & 1) != 0;
 
     barrier();
@@ -229,13 +291,13 @@ void main() {
 
     // K loads of block JJ, this subgroup's 16 KV rows for S: q8_0 as raw octets (kq), other types decoded (kreg)
 #define LOAD_K(JJ) \
-    if (FaTypeK == GGML_TYPE_Q8_0) { \
+    if (K_OCT) { \
         [[unroll]] for (uint32_t ch = 0; ch < HSK / KCH; ++ch) { \
             [[unroll]] for (uint32_t u = 0; u < U_K; ++u) { \
                 const uint32_t kv = (JJ) * Bc + sg * 16 + (lane / LPRK) * U_K + u; \
                 uvec3 w = uvec3(0); \
                 if (!KV_bounds_check || kv < KV) { \
-                    w = fa_load_octet_k(k_lane8 + ((JJ) * Bc + sg * 16 + u) * k_row_bytes + ch * (KCH / 32) * 34); \
+                    w = fa_load_octet_k(k_lane8 + ((JJ) * Bc + sg * 16 + u) * k_row_bytes + ch * (KCH / 32) * K_BLK_BYTES); \
                 } \
                 kq[ch][u] = w; \
             } \
@@ -261,12 +323,12 @@ void main() {
 
     // q8_0: the raw K octets become the halves staged for S
 #define DECODE_K() \
-    if (FaTypeK == GGML_TYPE_Q8_0) { \
+    if (K_OCT) { \
         [[unroll]] for (uint32_t ch = 0; ch < HSK / KCH; ++ch) { \
             const bool odd = ((ch * (KCH / 32) + k_oct / 4) & 1) != 0; \
             [[unroll]] for (uint32_t u = 0; u < U_K; ++u) { \
                 FLOAT_TYPEV4 lo, hi; \
-                fa_q8_0_octet(kq[ch][u], odd, lo, hi); \
+                fa_q8_0_octet(kq[ch][u], odd, K_Q4, k_nib_hi, lo, hi); \
                 kdec[ch][u] = fa_pack8(lo, hi); \
             } \
         } \
@@ -301,7 +363,7 @@ void main() {
         LOAD_MASK(j)
         FLOAT_TYPEV4 vreg[Bc / 16][V_ITEMS];
         uvec3 vq[Bc / 16][U_V];
-        if (FaTypeV == GGML_TYPE_Q8_0) {
+        if (V_OCT) {
             [[unroll]] for (uint32_t c16 = 0; c16 < Bc / 16; ++c16) {
                 [[unroll]] for (uint32_t u = 0; u < U_V; ++u) {
                     const uint32_t kv = j * Bc + c16 * 16 + (lane / LPRV) * U_V + u;
@@ -332,13 +394,11 @@ void main() {
         }
 
         // ---- S^T = K Q^T for this subgroup's 16 KV rows, 64 dims of K staged at a time
-        coopmat<ACC_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> S[row_tiles];
-        [[unroll]] for (uint32_t t = 0; t < row_tiles; ++t) {
-            S[t] = coopmat<ACC_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-        }
+        ACC_MAT S0 = ACC_MAT(0.0);
+        ACC_MAT S1 = ACC_MAT(0.0);
 
         [[unroll]] for (uint32_t ch = 0; ch < HSK / KCH; ++ch) {
-            if (FaTypeK == GGML_TYPE_Q8_0) {
+            if (K_OCT) {
                 [[unroll]] for (uint32_t u = 0; u < U_K; ++u) {
                     stg[sg * stg_sg8 + ((lane / LPRK) * U_K + u) * kstride8 + k_oct] = kdec[ch][u];
                 }
@@ -359,11 +419,11 @@ void main() {
                 coopMatLoad(Km, stg, sg * stg_sg8 + dd * 2, kstride8, gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint32_t t = 0; t < row_tiles; ++t) {
                     if (QF_REGS) {
-                        S[t] = coopMatMulAdd(Km, Qreg[t * (HSK / 16) + ch * (KCH / 16) + dd], S[t]);
+                        S_MULADD(t, Km, Qreg[t * (HSK / 16) + ch * (KCH / 16) + dd])
                     } else {
                         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Qm;
                         coopMatLoad(Qm, Qf, t * 16 * qstride8 + ch * (KCH / 8) + dd * 2, qstride8, gl_CooperativeMatrixLayoutColumnMajor);
-                        S[t] = coopMatMulAdd(Km, Qm, S[t]);
+                        S_MULADD(t, Km, Qm)
                     }
                 }
             }
@@ -374,8 +434,9 @@ void main() {
         uvec3 kq[HSK / KCH][U_K];
         LOAD_K(min(j + 1, end_j - 1))
 
-        [[unroll]] for (uint32_t t = 0; t < row_tiles; ++t) {
-            coopMatStore(S[t], sfsh, (sg * 16) * sstride + t * 16, sstride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(S0, sfsh, (sg * 16) * sstride, sstride, gl_CooperativeMatrixLayoutRowMajor);
+        if (row_tiles > 1) {
+            coopMatStore(S1, sfsh, (sg * 16) * sstride + 16, sstride, gl_CooperativeMatrixLayoutRowMajor);
         }
         barrier();
 
@@ -425,19 +486,19 @@ void main() {
 
         // ---- O = diag(eM) O + P V for this subgroup's output dims
         [[unroll]] for (uint32_t t = 0; t < row_tiles; ++t) {
-            coopmat<ACC_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> D;
+            ACC_MAT D;
             coopMatLoad(D, diag, t * 16 * 16, 16, gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint32_t h = 0; h < hsv_tiles; ++h) {
-                O[t * hsv_tiles + h] = O[t * hsv_tiles + h] * D;
+                O_SCALE(t * hsv_tiles + h, D)
             }
         }
 
         [[unroll]] for (uint32_t c16 = 0; c16 < Bc / 16; ++c16) {
             // V^T: each dim row gets this lane's consecutive KV rows (U_V for q8_0 octets, else V_ITEMS)
-            if (FaTypeV == GGML_TYPE_Q8_0) {
+            if (V_OCT) {
                 uvec4 vw[U_V];
                 [[unroll]] for (uint32_t u = 0; u < U_V; ++u) {
-                    vw[u] = fa_q8_0_octet_w(vq[c16][u], v_odd);
+                    vw[u] = fa_q8_0_octet_w(vq[c16][u], v_odd, V_Q4, v_nib_hi);
                 }
                 // pairs of rows as one word: the dim row gets this lane's U_V consecutive KV rows. Quant e of an octet is
                 // the low (e % 4 < 2) or high half of word (e / 4) * 2 + e % 2
@@ -464,15 +525,18 @@ void main() {
             subgroupMemoryBarrierShared();
             subgroupBarrier();
 
-            coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> P[row_tiles];
-            [[unroll]] for (uint32_t t = 0; t < row_tiles; ++t) {
-                coopMatLoad(P[t], Psh, (t * 16) * pstride4 + c16 * 4, pstride4, gl_CooperativeMatrixLayoutRowMajor);
+            A_MAT P0;
+            A_MAT P1;
+            coopMatLoad(P0, Psh, c16 * 4, pstride4, gl_CooperativeMatrixLayoutRowMajor);
+            if (row_tiles > 1) {
+                coopMatLoad(P1, Psh, 16 * pstride4 + c16 * 4, pstride4, gl_CooperativeMatrixLayoutRowMajor);
             }
             [[unroll]] for (uint32_t h = 0; h < hsv_tiles; ++h) {
                 coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Vm;
                 coopMatLoad(Vm, stg, sg * stg_sg8 + (h * 16) * vtstride8, vtstride8, gl_CooperativeMatrixLayoutColumnMajor);
-                [[unroll]] for (uint32_t t = 0; t < row_tiles; ++t) {
-                    O[t * hsv_tiles + h] = coopMatMulAdd(P[t], Vm, O[t * hsv_tiles + h]);
+                O_MULADD(h, P0, Vm)
+                if (row_tiles > 1) {
+                    O_MULADD(hsv_tiles + h, P1, Vm)
                 }
             }
             subgroupBarrier();
@@ -520,7 +584,7 @@ void main() {
 
     [[unroll]] for (uint32_t t = 0; t < row_tiles; ++t) {
         [[unroll]] for (uint32_t h = 0; h < hsv_tiles; ++h) {
-            coopMatStore(O[t * hsv_tiles + h], sfsh, sg * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+            O_STORE(t * hsv_tiles + h, sfsh, sg * 256, 16)
             subgroupMemoryBarrierShared();
             subgroupBarrier();
 
